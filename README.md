@@ -1,2 +1,2 @@
 The main file:
-dual_arm.py
+dual_panda.py
