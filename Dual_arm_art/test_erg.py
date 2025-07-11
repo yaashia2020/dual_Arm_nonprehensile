@@ -7,6 +7,8 @@ from pydrake.all import *
 import pydot
 from IPython.display import SVG, display
 from trajectoryERG import ExplicitReferenceGovernor
+import os
+from pydrake.visualization import AddDefaultVisualization
 
 def create_system_model(plant, scene_graph):
     """
@@ -19,7 +21,8 @@ def create_system_model(plant, scene_graph):
     Returns:
         Tuple containing the updated plant and scene_graph.
     """
-    urdf = "file:///home/art/drake_brubotics-main/models/descriptions/robots/panda_fr3/urdf/panda_fr3.urdf"
+    urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3.urdf"))
+    urdf = "file://" + urdf_path
     arm = Parser(plant).AddModelsFromUrl(urdf)
     plant.set_contact_surface_representation(mesh_type)
     plant.set_contact_model(contact_model)
@@ -51,11 +54,11 @@ num_velocities = plant.num_velocities()
 ######################################################################################################
 #              ##################Planner Trapezoidal motion profile ################
 ######################################################################################################
-trajDuration_ = 2.0
+trajDuration_ = 3.5
 accDuration_ = 2.5
 
 trajInit_ = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0]) # np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
-trajEnd_ = np.array([3.0, -1.000, 0.0, -1.5, 0.7, 1.571, 0.785, 0.0, 0.0]) # np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
+trajEnd_ = np.array([3.0, -0.785, -0.50, -1.6, 0.7, 1.571, 0.785, 0.0, 0.0]) # np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
 class TrajectoryPoint:
     def __init__(self):
         self.pos = np.zeros(9)
@@ -145,6 +148,7 @@ class ERG(LeafSystem):
         q_r = self._qr_port.Eval(context)
 
         # print(f"tau: \n {tau}")
+        print(f"q: \n {q}")
         self.q_v = context.get_discrete_state_vector().CopyToVector()              
         # Initialize q_v_ only at the first callback
         if self.first_update:
@@ -221,9 +225,8 @@ builder.Connect(plant.GetOutputPort("panda_net_actuation"), erg_system.GetInputP
 # Connect to visualizer
 if meshcat_visualisation:
     meshcat = StartMeshcat()
-    visualizer = MeshcatVisualizer.AddToBuilder( 
-        builder, scene_graph, meshcat,
-        MeshcatVisualizerParams(role=Role.kPerception, prefix="visual"))
+    AddDefaultVisualization(builder=builder, meshcat=meshcat)
+    print(f"MeshCat visualization available at: {meshcat.web_url()}")
 
 logger_x = LogVectorOutput(plant.get_state_output_port(), builder) #state
 logger_tau = LogVectorOutput(pid_controller.GetOutputPort("tau_u"), builder) #tau_u
@@ -250,15 +253,38 @@ if simulate:
     sim_time = trajDuration_  # or whatever your total simulation time is
     simulator_context = simulator.get_mutable_context()
 
+    print(f"Starting simulation for {sim_time} seconds...")
+    print(f"Initial positions: {trajInit_}")
+    print(f"Target positions: {trajEnd_}")
 
     # Run simulation
     while simulator_context.get_time() < sim_time:
          next_time = min(sim_time, simulator_context.get_time() + kStep)
          simulator.AdvanceTo(next_time)
-    # Run simulation and record for replays in MeshCat
-    meshcat.StartRecording()
-    simulator.AdvanceTo(sim_time)  # Adjust this time as needed
-    meshcat.PublishRecording()
+         if simulator_context.get_time() % 0.1 < kStep:  # Print every 0.1 seconds
+             print(f"Simulation time: {simulator_context.get_time():.2f}s")
+    
+    print("Simulation completed!")
+    
+    # Record and publish MeshCat visualization
+    if meshcat_visualisation:
+        print("Recording simulation for MeshCat replay...")
+        meshcat.StartRecording()
+        simulator.AdvanceTo(sim_time)  # Adjust this time as needed
+        meshcat.PublishRecording()
+        print("MeshCat recording published!")
+        
+        # Save HTML recording
+        html_path = os.path.join(os.path.dirname(__file__), "meshcat_recording_erg.html")
+        html_data = meshcat.StaticHtml()
+        print("Recording size (characters):", len(html_data))
+        
+        if len(html_data) > 0:
+            with open(html_path, "w") as f:
+                f.write(html_data)
+            print(f"Recording saved to: {html_path}")
+        else:
+            print("MeshCat recording appears to be empty. Did any geometry move?")
 
 
 # Assuming you have the following limits defined somewhere in your script

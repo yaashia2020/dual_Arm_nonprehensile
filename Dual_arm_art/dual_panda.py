@@ -15,26 +15,21 @@ from controllers.PID import PD_gravity
 meshcat = StartMeshcat()
 initPos = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.0]
 
-def get_relative_path(path):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(script_dir, path))
-
 def create_scene(sim_time_step):
     builder = DiagramBuilder()
     plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=sim_time_step)
     parser = Parser(plant)
 
-    # Use duplicated URDFs with different <robot name="...">
-    #panda_path_1 = get_relative_path("../../../models/descriptions/robots/panda_fr3/urdf/panda_fr3_nohand.urdf")
-    #panda_path_2 = get_relative_path("../../../models/descriptions/robots/panda_fr3/urdf/panda_fr3_nohand2.urdf")
-    panda_path_1 = "/home/art/dual_arm_example/models/robots/panda_fr3/urdf/panda_fr3_nohand.urdf"
-    panda_path_2 = "/home/art/dual_arm_example/models/robots/panda_fr3/urdf/panda_fr3_nohand2.urdf"
+    # Use relative paths for URDFs
+    panda_path_1 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3_nohand.urdf"))
+    panda_path_2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3_nohand2.urdf"))
 
     parser.AddModelsFromUrl("file://" + panda_path_1)  # loads 'panda'
     parser.AddModelsFromUrl("file://" + panda_path_2)  # loads 'panda_1'
 
-    fixed_box_path = get_relative_path("/home/art/dual_arm_example/models/boxes/fixed_box.sdf")
-    movable_box_path = get_relative_path("/home/art/dual_arm_example/models/boxes/movable_box.sdf")
+    # Use relative paths for SDF files
+    fixed_box_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/boxes/fixed_box.sdf"))
+    movable_box_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/boxes/movable_box.sdf"))
     parser.AddModelsFromUrl("file://" + fixed_box_path)
     parser.AddModelsFromUrl("file://" + movable_box_path)
 
@@ -93,7 +88,7 @@ def create_scene(sim_time_step):
 # Run simulation
 diagram, diagram_context, plant = create_scene(0.00001)
 simulator = Simulator(diagram)
-html_path = "/home/art/meshcat_recording.html"
+html_path = os.path.join(os.path.dirname(__file__), "meshcat_recording.html")
 with open(html_path, "w") as f:
     f.write(meshcat.StaticHtml())
     f.write(meshcat.StaticHtml())
@@ -110,7 +105,7 @@ meshcat.PublishRecording()
 
 # Save HTML22
 # Save Meshcat recording to HTML
-html_path = "/home/art/drake_brubotics-main/meshcat_recording.html"
+html_path = os.path.join(os.path.dirname(__file__), "meshcat_recording_final.html")
 
 html_data = meshcat.StaticHtml()
 print("Recording size (characters):", len(html_data))

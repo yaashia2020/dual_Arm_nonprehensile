@@ -1,6 +1,8 @@
 
 import time
 from pydrake.all import *
+import os
+import numpy as np
 
 
 ####################################
@@ -17,7 +19,8 @@ def create_system_model(plant, scene_graph):
     Returns:
         Tuple containing the updated plant and scene_graph.
     """
-    urdf = "file:///home/art/drake_brubotics-main/models/descriptions/robots/panda_fr3/urdf/panda_fr3.urdf"
+    urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3.urdf"))
+    urdf = "file://" + urdf_path
     arm = Parser(plant).AddModelsFromUrl(urdf)
     contact_model = ContactModel.kHydroelasticWithFallback  # Options: Hydroelastic, Point, or HydroelasticWithFallback
     discrete_solver = DiscreteContactApproximation.kSap # Options:kTamsi, kSap, kLagged, kSimilar
@@ -171,12 +174,15 @@ class ExplicitReferenceGovernor:
       DSM_dp_EE_ = self.dsmDpEE()
 
       # Find the minimum among the DSMs
+      print(f"DSM_tau_: {DSM_dq_}")
       DSM = min(DSM_tau_,DSM_dq_)
       DSM = min(DSM,DSM_q_)
       DSM = min(DSM,DSM_dp_EE_)
       # DSM = min(DSM,DSM_terminal_energy_)
 
-      DSM = max(DSM, 0.0)
+      DSM = max(DSM, 0)
+      print(f"DSM: {DSM}")
+    #   DSM =1.0
     # Print DSMs
     #   print(f"DSM_tau_: {DSM_tau_}")
     #   print(f"DSM_q_: {DSM_q_}")
@@ -211,17 +217,15 @@ class ExplicitReferenceGovernor:
             gravity_pred = - self.plant_pred.CalcGravityGeneralizedForces(self.plant_context) # Compute gravity_pred for the current state
             
 
-            print("Shapes inside trajectoryPredictions:")
-            print("q_v shape:", q_v.shape)
-            print("q_pred shape:", q_pred.shape) 
-            print("dq_pred shape:", dq_pred.shape)
-            print("gravity_pred shape:", gravity_pred.shape)
-            import numpy as np
+            # print("Shapes inside trajectoryPredictions:")
+            # print("q_v shape:", q_v.shape)
+            # print("q_pred shape:", q_pred.shape) 
+            # print("dq_pred shape:", dq_pred.shape)
+            # print("gravity_pred shape:", gravity_pred.shape)
+            # import numpy as np
             self.Kp_ = np.array(self.Kp_)
             self.Kd_ = np.array(self.Kd_)
 
-            print("Kp shape:", self.Kp_.shape)
-            print("Kd shape:", self.Kd_.shape)
 
             # Compute tau_pred
             tau_pred_partial = self.Kp_ * (q_v[:7] - q_pred[:7]) - self.Kd_ * dq_pred[:7] +gravity_pred[:7]
@@ -232,7 +236,9 @@ class ExplicitReferenceGovernor:
 
 
             # Solve for x[k+1] using the computed tau_pred
-            state_pred = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred)  # Adjust this based on your calculation method
+            
+            state_pred = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
+            print(f"state_pred: \n {state_pred}")
             q_pred = state_pred[:self.num_positions]
             dq_pred = state_pred[self.num_positions:]
 
@@ -308,25 +314,71 @@ class ExplicitReferenceGovernor:
     Since TamsiSolver uses regularized friction, we explicitly emphasize the functional dependence of fₜ(q, v) with the generalized velocities. 
     The functional dependence of fₜ(q, v) with the generalized positions stems from its direct dependence with the normal forces fₙ(q, v).
     '''
-    def calc_dynamics(self, x, u):
-        assert self.diagram.IsDifferenceEquationSystem()[0], "must be a discrete-time system"
+    def calc_dynamics(self, x, u, qv):
+        # print("IsDifferenceEquationSystem:", self.diagram.IsDifferenceEquationSystem())
+        # assert self.diagram.IsDifferenceEquationSystem()[0], "must be a discrete-time system"
         """
         Calculate the next state given the current state x and control input u.
         
         Args:
             x: Current state vector.
-            u: Control input vector.
+            u: Control input vector (torque).
+            qv: Desired position vector.
         
         Returns:
             The next state vector.
         """
-        # Autodiff copy of the system for computing dynamics gradients
-        self.plant_context.SetDiscreteState(x)
-        self.plant_pred.get_actuation_input_port().FixValue(self.plant_context, u)
-        state = self.diagram_context.get_discrete_state()
-        self.diagram.CalcForcedDiscreteVariableUpdate(self.diagram_context, state)
-        x_next = state.get_vector().value().flatten()
+        # Set the discrete state directly
+        state = self.plant_context.get_mutable_state()
+        discrete_values = state.get_mutable_discrete_state()
+        xd = discrete_values.get_mutable_vector()
+        xd.SetFromVector(x)
+
+        # Calculate gravity, mass matrix, and bias term
+        tau_g = self.plant_pred.CalcGravityGeneralizedForces(self.plant_context)  # gravity
+        M = self.plant_pred.CalcMassMatrix(self.plant_context)                    # mass matrix
+        C = self.plant_pred.CalcBiasTerm(self.plant_context)                      # bias term
+        
+        # Extract current state components
+        q = x[:self.num_positions]  # positions
+        dq = x[self.num_positions:]  # velocities
+        
+        # PD controller with gravity compensation
+        kp = np.array(self.Kp_)
+        kd = np.array(self.Kd_)
+        U = 7  # Number of actual robot joints (excluding extra joints)
+        
+        # Control law: u = kp * (qv - q) + kd * dq - tau_g
+        # Only apply control to the first 7 joints
+        u_control = kp * (qv[:7] - q[:7]) - kd * dq[:7] - tau_g[:7]
+        
+        # Add 2 zeros at the end for the extra joints
+        u_control = np.concatenate([u_control, [0, 0]])
+        
+        # End effector control (commented out in original)
+        # J_pseudo = J.completeOrthogonalDecomposition().pseudoInverse()
+        # u_control = -kp * J_pseudo * p_diff - kd * dq[:U] - tau_g[:U]
+        
+        # Compute acceleration using inverse dynamics
+        # Use only the first 7 elements for the dynamics calculation
+        # u_control_7 = u_control[:U]  # Take only first 7 elements
+        ddq = np.linalg.pinv(M) @ (u_control - C + tau_g)
+        
+        # Euler integration to get next state
+        dt = 0.01  # time step
+        dq_next = dq + ddq * dt
+        q_next = q + dq_next * dt
+        
+        # Handle extra joints (keep them unchanged or set to zero)
+        # if len(q) > U:
+        #     q_next = np.concatenate([q_next, q[U:]])  # Keep extra joints unchanged
+        #     dq_next = np.concatenate([dq_next, dq[U:]])  # Keep extra joints unchanged
+        
+        # Combine into state vector
+        x_next = np.concatenate([q_next, dq_next])
+        
         # print(x_next)
+        print(f"x - x_next = {x - x_next}")
         return x_next
 
 
