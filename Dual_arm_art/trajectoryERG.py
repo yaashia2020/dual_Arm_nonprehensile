@@ -127,10 +127,10 @@ class ExplicitReferenceGovernor:
 
         q_v_new = q_v + DSM_ * rho_ * self.dt_ 
         
-        if DSM_ > 0:
-          q_v_new = q_v + DSM_ * rho_ * self.dt_ 
-        else:
-          q_v_new = q_v + np.min([np.linalg.norm(DSM_ * rho_ * self.dt_), np.linalg.norm(q_r - q_v)]) * DSM_ * rho_ / max(np.linalg.norm(DSM_ * rho_), self.eta_)
+        # if DSM_ > 0:
+        #   q_v_new = q_v + DSM_ * rho_ * self.dt_ 
+        # else:
+        #   q_v_new = q_v + np.min([np.linalg.norm(DSM_ * rho_ * self.dt_), np.linalg.norm(q_r - q_v)]) * DSM_ * rho_ / max(np.linalg.norm(DSM_ * rho_), self.eta_)
         
         return q_v_new
 
