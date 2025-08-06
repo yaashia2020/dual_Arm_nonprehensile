@@ -1,4 +1,3 @@
-
 import time
 from pydrake.all import *
 import os
@@ -37,7 +36,7 @@ def create_system_model(plant, scene_graph):
 class ExplicitReferenceGovernor:
     def __init__(self, robust_delta_tau_, kappa_tau_, 
                  robust_delta_q_, kappa_q_, robust_delta_dq_, kappa_dq_, 
-                 robust_delta_dp_EE_, kappa_dp_EE_, kappa_terminal_energy_):
+                 robust_delta_dp_EE_, kappa_dp_EE_, kappa_terminal_energy_, FD_=1.0):
         """
         Initialize the Explicit Reference Governor (ERG) with given parameters.
         
@@ -51,6 +50,7 @@ class ExplicitReferenceGovernor:
             robust_delta_dp_EE_ (float): Robustness parameter for end-effector velocities.
             kappa_dp_EE_ (float): Scaling parameter for end-effector velocities.
             kappa_terminal_energy_ (float): Scaling parameter for terminal energy.
+            FD_ (float): Force damping parameter for soft navigation field.
         """
         # Plant Configuration parameters
         time_step = 0.01
@@ -88,6 +88,7 @@ class ExplicitReferenceGovernor:
         self.robust_delta_dp_EE_ = robust_delta_dp_EE_
         self.kappa_dp_EE_ = kappa_dp_EE_
         self.kappa_terminal_energy_ = kappa_terminal_energy_
+        self.FD_ = FD_  # Force damping parameter
 
         self.num_positions =  self.plant_pred.num_positions()
         self.num_velocities = self.plant_pred.num_velocities()
@@ -103,9 +104,9 @@ class ExplicitReferenceGovernor:
         self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
         self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
         self.limit_dp_EE_ = [1.7, 2.5]  # Translation and rotation limits for the end effector
+        self.E_max_ = 10.0  # Maximum energy limit
 
-
-    def get_qv(self, q, dq, tau, q_r, q_v):
+    def get_qv(self, q, dq, tau, q_r, q_v, box_position=None):
         """
         Compute the new reference joint positions using the navigation field and DSM.
         
@@ -115,6 +116,7 @@ class ExplicitReferenceGovernor:
             tau (np.array): Current joint torques.
             q_r (np.array): Desired reference joint positions.
             q_v (np.array): Current applied reference joint positions.
+            box_position (np.array): Current box position
         
         Returns:
             np.array: Updated reference joint positions.
@@ -122,8 +124,8 @@ class ExplicitReferenceGovernor:
 
         
         
-        rho_ = self.navigationField(q_r, q_v)
-        DSM_ = self.trajectoryBasedDSM(q, dq, tau, q_v)
+        rho_ = self.navigationField(q_r, q_v, box_position)
+        DSM_ = self.trajectoryBasedDSM(q, dq, tau, q_v, box_position)
 
         q_v_new = q_v + DSM_ * rho_ * self.dt_ 
         
@@ -134,7 +136,26 @@ class ExplicitReferenceGovernor:
         
         return q_v_new
 
-    def navigationField(self, q_r, q_v):
+    def get_energy(self, q, dq, tau, q_r, q_v, box_position=None):
+        """
+        Get the calculated energy from trajectory predictions.
+        
+        Args:
+            q (np.array): Current joint positions.
+            dq (np.array): Current joint velocities.
+            tau (np.array): Current joint torques.
+            q_r (np.array): Desired reference joint positions.
+            q_v (np.array): Current applied reference joint positions.
+            box_position (np.array): Current box position
+        
+        Returns:
+            float: Calculated total energy.
+        """
+        # Get trajectory predictions and return the calculated energy
+        total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
+        return total_energy
+
+    def navigationField(self, q_r, q_v, box_position_constraint=None):
         """
         Compute the navigation field based on attraction and repulsion forces.
         """
@@ -154,35 +175,130 @@ class ExplicitReferenceGovernor:
         # print(f"norm rho_rep_q = {np.linalg.norm(rho_rep_q)}")
         # print(f"rho_rep_q = \n {rho_rep_q}")
 
+        # Soft navigation field (if box position constraint is provided)
+        rho_soft = np.zeros(self.num_positions)
+        if box_position_constraint is not None:
+            rho_soft = self.soft_navigation_field(box_position_constraint, q_v)
+
         # Total navigation field
-        rho = rho_att + rho_rep_q
+        rho = rho_att + rho_rep_q + rho_soft
         return rho
 
-    def trajectoryBasedDSM(self, q, dq, tau, q_v):
+    def soft_navigation_field(self, box_position_constraint, q_v):
+        """
+        Compute soft navigation field based on box position constraint.
+ 
+        """
+        # Define parameters (you can adjust these)
+        delta_s = 0.1  # Safety distance
+        eta_ = 0.005  # Small value to avoid division by zero
+        
+        # Define constraint vector
+        c = np.array([-1.0, 0.0, 0.0])  # Vector c = [-1, 0, 0]
+        
+        # Initialize soft repulsion vector
+        U = self.num_positions  # Number of joints
+        soft_rep = np.zeros(U)
+        
+        # Set the plant context to use q_v (current reference) instead of current joint positions
+        state = self.plant_context.get_mutable_state()
+        discrete_values = state.get_mutable_discrete_state()
+        xd = discrete_values.get_mutable_vector()
+        # Set positions to q_v and velocities to zero
+        xd.SetFromVector(np.concatenate([q_v, np.zeros(U)]))
+        
+        # Get link positions and calculate Jacobians using q_v
+        link_positions = []
+        jacobians = []
+        link_names = []
+        
+        for j in range(1, 8):  # Links 1-7 (changed from 1-6)
+            body_name = f"panda_link{j}"
+            link_names.append(body_name)
+            
+            body = self.plant_pred.GetBodyByName(body_name)
+            body_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body)
+            link_position = body_pose.translation()
+            link_positions.append(link_position)
+            
+            # Calculate Jacobian for this link
+            frame = self.plant_pred.GetFrameByName(body_name)
+            world_frame = self.plant_pred.world_frame()
+            
+            # Calculate translational velocity Jacobian
+            Jq_V_WEp = self.plant_pred.CalcJacobianTranslationalVelocity(
+                self.plant_context,
+                JacobianWrtVariable.kQDot,
+                frame,
+                np.zeros(3),  # p_BoBp_B
+                world_frame,
+                world_frame
+            )
+            
+            # Calculate pseudoinverse of Jacobian
+            J_pinv = np.linalg.pinv(Jq_V_WEp)
+            jacobians.append(J_pinv)
+        
+        # Calculate normalized q_dots for each link
+        normalized_q_dots = []
+        for i in range(len(link_positions)-1):  # This will be 0-6 for 7 links
+            qdot = jacobians[i] @ c
+            norm_qdot = np.linalg.norm(qdot)
+            normalized_q_dot = qdot / max(norm_qdot, eta_)
+            normalized_q_dots.append(normalized_q_dot)
+        
+        # Calculate soft repulsion for each link
+        for i in range(1, len(link_positions)):  # Start from 1 as in C++ code
+            link_pos = link_positions[i]
+            
+            # Calculate scale factor using individual joint KP gains
+            w = box_position_constraint[0]  # Use only the x-component of box position
+            dot_product = np.dot(c, link_pos)
+            
+            # Debug: Check types and values
+
+            
+            # Ensure all components are scalars
+            w_scalar = float(w)
+            dot_product_scalar = float(dot_product)
+            kp_scalar = float(self.Kp_[i-1])
+            delta_s_scalar = float(delta_s)
+            fd_scalar = float(self.FD_)
+            
+            scale_value = -kp_scalar * ((w_scalar + dot_product_scalar) / (delta_s_scalar * fd_scalar))
+            scale = max(scale_value, 0.0)  # Ensure scalar result
+
+            
+            # Add to soft repulsion vector
+            soft_rep[:7] += scale * normalized_q_dots[i-1][:7]  # Apply to first 7 joints
+        
+        return soft_rep
+
+    def trajectoryBasedDSM(self, q, dq, tau, q_v, box_position):
       """
       Compute the Dynamic Safety Margin (DSM) based on trajectory predictions.
       """
       # Get trajectory predictions and save predicted q, dq, and tau in lists
       start_time = time.time()
-      self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
-      print(f"TIme taken to predict  x= {(time.time() - start_time)*1000} ms")
+      total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
 
       # Compute DSMs
       DSM_tau_ = self.dsmTau()
       DSM_q_ = self.dsmQ()
       DSM_dq_ = self.dsmDq()
       DSM_dp_EE_ = self.dsmDpEE()
+      DSM_s_ = self.dsmS(box_position)
+      DSM_energy_ = self.dsmEnergy(total_energy, box_position, DSM_s_)
 
       # Find the minimum among the DSMs
-      print(f"DSM_tau_: {DSM_dq_}")
       DSM = min(DSM_tau_,DSM_dq_)
       DSM = min(DSM,DSM_q_)
       DSM = min(DSM,DSM_dp_EE_)
+      DSM = min(DSM,DSM_energy_)
       # DSM = min(DSM,DSM_terminal_energy_)
 
       DSM = max(DSM, 0)
-      print(f"DSM: {DSM}")
-    #   DSM =1.0
+      # DSM =1.0
     # Print DSMs
     #   print(f"DSM_tau_: {DSM_tau_}")
     #   print(f"DSM_q_: {DSM_q_}")
@@ -198,6 +314,34 @@ class ExplicitReferenceGovernor:
         """
         q_pred, dq_pred = state[:self.num_positions], state[self.num_positions:]
         tau_pred = tau
+
+        # Calculate energy at the beginning of trajectory prediction
+        # Energy = InertiaMatrix*joint_velocity^2 + Kp_gains*(q_v-q)^2
+        try:
+            # Set the plant context to current joint positions (like in calc_dynamics)
+            state = self.plant_context.get_mutable_state()
+            discrete_values = state.get_mutable_discrete_state()
+            xd = discrete_values.get_mutable_vector()
+            xd.SetFromVector(np.concatenate([q_pred, dq_pred]))
+            
+            # Get the mass matrix (inertia matrix) for the current configuration
+            mass_matrix = self.plant_pred.CalcMassMatrix(self.plant_context)
+            
+            # Kinetic energy: 0.5 * dq^T * M * dq
+            kinetic_energy = 0.5 * dq_pred.T @ mass_matrix @ dq_pred
+            
+            # Potential energy: 0.5 * position_error^T * Kp_diagonal_matrix * position_error
+            # Use only first 7 joints for Kp gains (matching the controller)
+            position_error = q_v[:7] - q_pred[:7]
+            Kp_diag_matrix = np.diag(self.Kp_)  # Create diagonal matrix from Kp gains
+            potential_energy = 0.5 * position_error.T @ Kp_diag_matrix @ position_error
+            
+            # Total energy
+            total_energy = kinetic_energy + potential_energy
+            
+        except Exception as e:
+            print(f"Energy calculation failed: {e}")
+            total_energy = 0.0
 
         # Initialize lists to store predicted states
         q_pred_traj = [q_pred.copy()]
@@ -238,7 +382,6 @@ class ExplicitReferenceGovernor:
             # Solve for x[k+1] using the computed tau_pred
             
             state_pred = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
-            print(f"state_pred: \n {state_pred}")
             q_pred = state_pred[:self.num_positions]
             dq_pred = state_pred[self.num_positions:]
 
@@ -259,39 +402,7 @@ class ExplicitReferenceGovernor:
         dq_pred_traj = np.array(dq_pred_traj)
         tau_pred_traj = np.array(tau_pred_traj)
 
-        # # Define total prediction time T and time step size dt
-        # dt = 0.2 / self.num_pred_samples_  # Time step size
-        # time_steps = np.linspace(0, 0.2, self.num_pred_samples_ + 1)  # Time steps array
-
-        # Assuming time_steps, q_pred_traj, dq_pred_traj, tau_pred_traj, q_desired_traj, dq_desired_traj, tau_desired_traj are defined
-
-        # plt.figure()
-
-        # Plot predicted states
-        # plt.plot(time_steps, q_pred_traj, label='Predicted q', linestyle='-', color='b')
-        # plt.plot(time_steps, dq_pred_traj, label='Predicted dq', linestyle='--', color='b')
-        # plt.plot(time_steps, tau_pred_traj, label='Predicted tau', linestyle=':', color='b')
-
-        # plt.xlabel('Time')
-        # plt.ylabel('Angle Position / Velocity / Torque')
-        # plt.legend()
-        # plt.title('Predicted vs Desired States')
-        # plt.show()
-
-        # Plot predicted states vs desired states for each joint
-        # num_joints = self.num_positions
-        # fig, axs = plt.subplots(num_joints, 1, figsize=(10, 2 * num_joints))
-
-        # for i in range(num_joints):
-        #     axs[i].plot(time_steps, q_pred_traj[:, i], label='Predicted q', linestyle='-', color='b')
-        #     axs[i].plot(time_steps, q_v[i] * np.ones_like(time_steps), label='Desired q', linestyle='--', color='r')
-        #     axs[i].set_xlabel('Time')
-        #     axs[i].set_ylabel(f'Joint {i+1} Position')
-        #     axs[i].legend()
-        #     axs[i].set_title(f'Predicted vs Desired Position for Joint {i+1}')
-
-        # plt.tight_layout()
-        # plt.show()
+        return total_energy
 
     # Calculate system dynamics
     '''
@@ -315,8 +426,7 @@ class ExplicitReferenceGovernor:
     The functional dependence of fₜ(q, v) with the generalized positions stems from its direct dependence with the normal forces fₙ(q, v).
     '''
     def calc_dynamics(self, x, u, qv):
-        # print("IsDifferenceEquationSystem:", self.diagram.IsDifferenceEquationSystem())
-        # assert self.diagram.IsDifferenceEquationSystem()[0], "must be a discrete-time system"
+    
         """
         Calculate the next state given the current state x and control input u.
         
@@ -359,26 +469,18 @@ class ExplicitReferenceGovernor:
         # J_pseudo = J.completeOrthogonalDecomposition().pseudoInverse()
         # u_control = -kp * J_pseudo * p_diff - kd * dq[:U] - tau_g[:U]
         
-        # Compute acceleration using inverse dynamics
-        # Use only the first 7 elements for the dynamics calculation
-        # u_control_7 = u_control[:U]  # Take only first 7 elements
+
         ddq = np.linalg.pinv(M) @ (u_control - C + tau_g)
         
         # Euler integration to get next state
         dt = 0.01  # time step
         dq_next = dq + ddq * dt
         q_next = q + dq_next * dt
-        
-        # Handle extra joints (keep them unchanged or set to zero)
-        # if len(q) > U:
-        #     q_next = np.concatenate([q_next, q[U:]])  # Keep extra joints unchanged
-        #     dq_next = np.concatenate([dq_next, dq[U:]])  # Keep extra joints unchanged
-        
-        # Combine into state vector
+
         x_next = np.concatenate([q_next, dq_next])
         
         # print(x_next)
-        print(f"x - x_next = {x - x_next}")
+        # print(f"x - x_next = {x - x_next}")
         return x_next
 
 
@@ -442,6 +544,75 @@ class ExplicitReferenceGovernor:
 
         DSM_dotp_EE = self.kappa_dp_EE_ * DSM_dotp_EE
         return DSM_dotp_EE
+
+    def dsmS(self, box_position):
+        """
+        Compute the DSM for distance-based safety margin.
+        """
+        for k in range(self.q_pred_list_.shape[1]):  # number of prediction samples + 1
+            q_pred = self.q_pred_list_[:, k]
+            DSM_s_temp = self.calculateDsmS(box_position, q_pred) - self.robust_delta_q_  # Use robust_delta_q_ for distance safety margin
+            if k == 0:
+                DSM_s = DSM_s_temp
+            else:
+                DSM_s = min(DSM_s, DSM_s_temp)
+
+        DSM_s = self.kappa_q_ * DSM_s  # Use kappa_q_ as scaling factor
+        return DSM_s
+
+    def dsmEnergy(self, total_energy,box_position, dsm_s):
+
+        # DSM energy: max(kappaS * dsm_s, kappaE * (E_max - E_current))
+        kappaS = 1.0  # You can adjust this parameter
+        kappaE = self.kappa_terminal_energy_
+        
+        DSM_energy = max(kappaS * dsm_s, kappaE * (self.E_max_ - total_energy))
+        return DSM_energy
+
+    def calculateDsmS(self, box_position, q_pred=None):
+        """
+        Calculate DSM_s based on distance between robot links and tracked object.
+        Uses the passed box position parameter and predicted joint positions.
+        """
+        if box_position is None:
+            return float('inf')
+        
+        # Get robot link positions from current plant state
+        init_link_id = 1  # Start from first robot link
+        final_link_id = 7  # End at last robot link
+        
+        plant_positions = []
+        
+        # Get positions of robot links from current plant context
+        for j in range(init_link_id, final_link_id + 1):
+            body_name = f"panda_link{j}"
+            body = self.plant_pred.GetBodyByName(body_name)
+            body_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body)
+            link_position = body_pose.translation()
+            plant_positions.append(link_position)
+        
+        if not plant_positions:
+            return float('inf')
+        
+        # Convert to numpy array
+        plant_positions = np.array(plant_positions).T  # 3 x num_links
+        
+        # Define constraint vector
+        c = np.array([-1.0, 0.0, 0.0])  # Vector c = [-1, 0, 0]
+        
+        # Box position constraint - use box's x value
+        box_constraint = box_position[0]  # Use x coordinate of box position
+        
+        # Calculate minimum distance using the C++ logic pattern
+        wall = float('inf')
+        for k in range(plant_positions.shape[1]):
+            link_pos = plant_positions[:, k]
+            # Calculate: (box_constraint - c.dot(link_pos))
+            distance = box_constraint - np.dot(c, link_pos)
+            wall = min(distance, wall)
+        
+        # Return the minimum wall value
+        return wall
 
     def distanceTau(self, tau_pred):
         for i in range(7):

@@ -95,13 +95,17 @@ num_velocities = plant.num_velocities(panda_id)
 #              ##################Relaxed IK System for Box Tracking################
 ######################################################################################################
 class RelaxedIKBoxTracker(LeafSystem):
-    def __init__(self):
+    def __init__(self, plant, plant_context):
         super().__init__()
         
-        # Declare input port for box position
-        self._box_position_port = self.DeclareVectorInputPort(name="box_position", size=3)
+        # Store plant and context references
+        self.plant = plant
+        self.plant_context = plant_context
         
-        state_index = self.DeclareDiscreteState(9)  # 9 joint angles
+        # Declare input port for box state (13 values: 7 pose + 6 velocities)
+        self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
+        
+        state_index = self.DeclareDiscreteState(9)  # Back to 9 joint angles
         self.DeclareStateOutputPort("ik_joint_targets", state_index)
         
         # Periodic update for IK solving
@@ -126,7 +130,7 @@ class RelaxedIKBoxTracker(LeafSystem):
         # Default orientation (quaternion xyzw)
         self.default_orientation = [0.0, 0.0, 0.0, 1.0]
         
-        # Fallback joint configuration if IK fails
+        # Fallback joint configuration if IK fails (back to 9 joints)
         self.fallback_joints = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0]
 
     def solve_ik(self, context, discrete_state):
@@ -136,8 +140,9 @@ class RelaxedIKBoxTracker(LeafSystem):
             return
         
         try:
-            # Get box position from input port
-            box_pos = self._box_position_port.Eval(context)
+            # Get box state from input port and extract position (indices 4:7)
+            box_state = self._box_state_port.Eval(context)
+            box_pos = box_state[4:7]  # Extract position values (X, Y, Z) from 13-element state
             
             # Use box position directly as target (no offset)
             target_position = [box_pos[0], box_pos[1], box_pos[2]]
@@ -161,11 +166,8 @@ class RelaxedIKBoxTracker(LeafSystem):
             if len(full_solution) != 9:
                 full_solution = self.fallback_joints
             
-            # Update the discrete state
+            # Update the discrete state - use all 9 joints
             discrete_state.get_mutable_vector().SetFromVector(full_solution)
-            
-            print(f"Box position: {target_position}")
-            print(f"IK solution: {full_solution}")
             
         except Exception as e:
             print(f"IK solving failed: {e}")
@@ -244,10 +246,15 @@ class ERG(LeafSystem):
         super().__init__()  # Don't forget to initialize the base class.
         self._state_port = self.DeclareVectorInputPort(name="state", size=18)
         self._tau_port = self.DeclareVectorInputPort(name="tau", size=9)
-        self._qr_port = self.DeclareVectorInputPort(name="q_r", size=9)
+        self._qr_port = self.DeclareVectorInputPort(name="q_r", size=9)  # Back to 9 joints
+        self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
 
-        state_index = self.DeclareDiscreteState(9)  # One state variable.
+        state_index = self.DeclareDiscreteState(9)  # Back to 9 joints
         self.DeclareStateOutputPort("q_v_filtered", state_index)  # One output: y=x.
+        
+        # Add output port for calculated energy
+        self.DeclareVectorOutputPort("calculated_energy", size=1, calc=self.output_energy)
+        
         self.DeclarePeriodicDiscreteUpdateEvent(
             period_sec=0.01,  # time step.
             offset_sec=0.0,  # The first event is at time zero.
@@ -255,7 +262,7 @@ class ERG(LeafSystem):
         self.erg = ExplicitReferenceGovernor(
             robust_delta_tau_=0.1, kappa_tau_=1.0,
             robust_delta_q_=0.1, kappa_q_=15.0, robust_delta_dq_=0.1, kappa_dq_=7.0,
-            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5)
+            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0)
 
         # Initialize a flag to check if it's the first update
         self.first_update = True
@@ -267,19 +274,30 @@ class ERG(LeafSystem):
         dq = state[num_positions:]
         tau = self._tau_port.Eval(context)
         q_r = self._qr_port.Eval(context)
+        box_state = self._box_state_port.Eval(context)
+        box_position = box_state[4:7]  # Extract position values (X, Y, Z) from 13-element state
 
-        # print(f"tau: \n {tau}")
-        print(f"q: \n {q}")
         self.q_v = context.get_discrete_state_vector().CopyToVector()              
         # Initialize q_v_ only at the first callback
         if self.first_update:
-            self.q_v_ = trajInit_  # or an appropriate initial value    
+            self.q_v_ = trajInit_  # Use all 9 joints    
             self.first_update = False
-        self.q_v_ = self.erg.get_qv(q, dq, tau, q_r, self.q_v_)
+        
+        # Update box position in ERG
+        self.q_v_ = self.erg.get_qv(q, dq, tau, q_r, self.q_v_, box_position)
+        
+        # Calculate energy from trajectory predictions
+        self.calculated_energy = self.erg.get_energy(q, dq, tau, q_r, self.q_v_, box_position)
 
         # Write into the output vector.
-        # print(f"filtered ref = \n {self.q_v_}")
         discrete_state.get_mutable_vector().SetFromVector(self.q_v_)
+        
+    def output_energy(self, context, output):
+        # Return the calculated energy from the ERG system
+        if hasattr(self, 'calculated_energy'):
+            output.SetAtIndex(0, self.calculated_energy)
+        else:
+            output.SetAtIndex(0, 0.0)
 
 
 ######################################################################################################
@@ -289,12 +307,12 @@ class PD_gravity(LeafSystem):
     def __init__(self):
         super().__init__()
 
-        self._desired_state_port = self.DeclareVectorInputPort(name="Desired_state", size=9)
+        self._desired_state_port = self.DeclareVectorInputPort(name="Desired_state", size=9)  # Back to 9 joints
         self._current_state_port = self.DeclareVectorInputPort(name="Current_state", size=18)
-        self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120, 120]
-        self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5, 5]
+        self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120, 120]  # Back to 9 joints
+        self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5, 5]  # Back to 9 joints
 
-        state_index = self.DeclareDiscreteState(9)  # One state variable.
+        state_index = self.DeclareDiscreteState(9)  # Keep 9 for output (7 robot + 2 gripper)
         self.DeclareStateOutputPort("tau_u", state_index)  # One output: y=x.
         self.DeclarePeriodicDiscreteUpdateEvent(
             period_sec=1/1000,  # One second time step.
@@ -303,63 +321,97 @@ class PD_gravity(LeafSystem):
         
     def compute_tau_u(self, context, discrete_state):
         # Evaluate the input ports
-        self.q_d =self._desired_state_port.Eval(context)
-        self.q = self._current_state_port.Eval(context)
+        self.q_d =self._desired_state_port.Eval(context)  # 9 joints
+        self.q = self._current_state_port.Eval(context)    # 18 states (9 pos + 9 vel)
         # x = context.get_discrete_state_vector().GetAtIndex(0)
         
         # Get gravity for entire plant and extract panda portion
         gravity_full = -plant.CalcGravityGeneralizedForces(plant_context)
         # Convert to numpy array and extract first 9 elements for robot
         gravity_full_np = np.array(gravity_full).flatten()
-        print(f"gravity_full shape: {gravity_full_np.shape}")
         gravity = gravity_full_np[:9]  # Force to 9 elements for robot
-        print(f"gravity shape after slicing: {gravity.shape}")
         
-        tau = self.Kp_ * (self.q_d - self.q[:num_positions]) - self.Kd_ * self.q[num_positions:]
-        tau = tau + gravity
+        # Calculate torque for all 9 joints
+        tau = self.Kp_ * (self.q_d - self.q[:9]) - self.Kd_ * self.q[9:18]  # Use all 9 joints
+        tau = tau + gravity  # Add gravity for all 9 joints
         
-        # print(f"applied torque = \n {tau}")
         discrete_state.get_mutable_vector().SetFromVector(tau)
+
+######################################################################################################
+#                                  ########Contact Force Converter#######
+######################################################################################################
+class ContactForceConverter(LeafSystem):
+    def __init__(self, plant):
+        super().__init__()
+        self.plant = plant
+        
+        # Input port for contact results
+        self.DeclareAbstractInputPort("contact_results", 
+                                    plant.get_contact_results_output_port().Allocate())
+        
+        # Output port for contact forces (3D vector)
+        self.DeclareVectorOutputPort("contact_forces", size=3, calc=self.calc_output)
+    
+    def calc_output(self, context, output):
+        # Get contact results from input port
+        contact_results = self.GetInputPort("contact_results").Eval(context)
+        
+        # Initialize output to zero
+        output.SetFromVector([0.0, 0.0, 0.0])
+        
+        # Check if there are any contacts
+        if contact_results.num_point_pair_contacts() == 0:
+            print("No contacts detected")
+            return
+        
+        # Get number of contacts
+        num_contacts = contact_results.num_point_pair_contacts()
+        print(f"Total contacts detected: {num_contacts}")
+        
+        # Define robot links to check for contacts
+        robot_links = ["panda_link1", "panda_link2", "panda_link3", "panda_link4", 
+                      "panda_link5", "panda_link6", "panda_link7", "panda_hand"]
+        object_name = "box_link"
+        
+        # Sum up all contact forces between robot and box
+        total_force = [0.0, 0.0, 0.0]
+        robot_box_contacts = 0
+        
+        for i in range(num_contacts):
+            contact_info = contact_results.point_pair_contact_info(i)
+            
+            bodyA_idx = contact_info.bodyA_index()
+            bodyB_idx = contact_info.bodyB_index()
+            
+            bodyA_name = self.plant.get_body(bodyA_idx).name()
+            bodyB_name = self.plant.get_body(bodyB_idx).name()
+            
+            print(f"Contact {i}: {bodyA_name} <-> {bodyB_name}")
+            
+            # Check if this contact is between any robot link and box
+            if ((bodyA_name == object_name or bodyB_name == object_name) and
+                (bodyA_name in robot_links or bodyB_name in robot_links)):
+                
+                robot_box_contacts += 1
+                force = contact_info.contact_force()
+                print(f"  Robot-Box contact detected! Force: [{force[0]:.3f}, {force[1]:.3f}, {force[2]:.3f}]")
+                
+                # Extract contact force and add to total
+                total_force[0] += force[0]
+                total_force[1] += force[1]
+                total_force[2] += force[2]
+        
+        print(f"Robot-Box contacts: {robot_box_contacts}")
+        print(f"Total force: [{total_force[0]:.3f}, {total_force[1]:.3f}, {total_force[2]:.3f}]")
+        
+        # Set the total contact force
+        output.SetFromVector(total_force)
 
 ######################################################################################################
 #                                  ##################################
 ######################################################################################################
 ######################################################################################################
 #                                  ########Box Position Extractor#######
-######################################################################################################
-class BoxPositionExtractor(LeafSystem):
-    def __init__(self, plant, plant_context, box_id):
-        super().__init__()
-        
-        # Store references
-        self.plant = plant
-        self.plant_context = plant_context
-        self.box_id = box_id
-        
-        # Output port for box position
-        self.DeclareVectorOutputPort("box_position", size=3, calc=self.extract_box_position)
-    
-    def extract_box_position(self, context, output):
-        try:
-            # Get the box body
-            box_body = self.plant.GetBodyByName("box_link", self.box_id)
-            
-            # Get the pose of the box body in world frame
-            X_WB = self.plant.EvalBodyPoseInWorld(self.plant_context, box_body)
-            
-            # Extract position (translation)
-            position = X_WB.translation()
-            pos = [position[0], position[1], position[2]]
-            
-            output.SetFromVector(pos)
-            
-        except Exception as e:
-            print(f"Error extracting box position: {e}")
-            # Return default position if extraction fails
-            output.SetFromVector([0.7, 0.0, 0.7])
-
-######################################################################################################
-#                                  ##################################
 ######################################################################################################
 # Get the box model instance ID for the position extractor
 box_id = plant.GetModelInstanceByName("movable_box")
@@ -372,13 +424,23 @@ erg_system = builder.AddNamedSystem("Trajectory-based ERG", ERG())
 pid_controller = builder.AddNamedSystem("PD+G controller", PD_gravity())
 
 # Add new systems for IK-based control
-box_position_extractor = builder.AddNamedSystem("Box Position Extractor", 
-                                               BoxPositionExtractor(plant, plant_context, box_id))
-ik_box_tracker = builder.AddNamedSystem("Relaxed IK Box Tracker", RelaxedIKBoxTracker())
+# Remove the custom box position extractor and use plant state output directly
+ik_box_tracker = builder.AddNamedSystem("Relaxed IK Box Tracker", RelaxedIKBoxTracker(plant, plant_context))
 
-# Connect box position extractor to IK system
-builder.Connect(box_position_extractor.GetOutputPort("box_position"), 
-               ik_box_tracker.GetInputPort("box_position"))
+# Add contact force converter system
+contact_force_converter = builder.AddNamedSystem("Contact Force Converter", ContactForceConverter(plant))
+
+# Connect plant state output to IK system (box state will be extracted inside the system)
+builder.Connect(plant.get_state_output_port(box_id), 
+               ik_box_tracker.GetInputPort("box_state"))
+
+# Connect plant state output to ERG system (box state will be extracted inside the system)
+builder.Connect(plant.get_state_output_port(box_id), 
+               erg_system.GetInputPort("box_state"))
+
+# Connect contact results to contact force converter
+builder.Connect(plant.get_contact_results_output_port(),
+               contact_force_converter.GetInputPort("contact_results"))
 
 # Connect trajectory generator inputs
 builder.Connect(init_pos.GetOutputPort("y0"), trajectory.GetInputPort("trajInit_"))
@@ -405,53 +467,19 @@ logger_x = LogVectorOutput(plant.get_state_output_port(), builder) #state
 logger_tau = LogVectorOutput(pid_controller.GetOutputPort("tau_u"), builder) #tau_u
 logger_qv = LogVectorOutput(erg_system.GetOutputPort("q_v_filtered"), builder) #q_v
 logger_qr = LogVectorOutput(ik_box_tracker.GetOutputPort("ik_joint_targets"), builder) #ik targets
-logger_box_pos = LogVectorOutput(box_position_extractor.GetOutputPort("box_position"), builder) #box position
+logger_box_pos = LogVectorOutput(plant.get_state_output_port(box_id), builder) #box position
+
+# Add logger for movable box body poses
+logger_box_poses = LogVectorOutput(plant.get_state_output_port(box_id), builder) #movable box poses only
+
+# Add loggers for energy and contact forces
+logger_energy = LogVectorOutput(erg_system.GetOutputPort("calculated_energy"), builder) #calculated energy from ERG
+logger_contact_forces = LogVectorOutput(contact_force_converter.GetOutputPort("contact_forces"), builder) #contact forces between robot and box
 
 # Finalize the diagram
 diagram = builder.Build()
 diagram.set_name("diagram")
 diagram_context = diagram.CreateDefaultContext()
-
-######################################################################################################
-#                                  ########Simple Box Tracker#######
-######################################################################################################
-def get_box_pose_in_world(plant, plant_context, box_id, collect_data=True, box_positions=None, box_orientations=None):
-    """
-    Simple function to get box position and orientation in world frame using EvalBodyPoseInWorld.
-    
-    Args:
-        plant: The MultibodyPlant object
-        plant_context: The plant context
-        box_id: The box model instance ID
-        collect_data: Whether to collect data for plotting
-        box_positions: List to store position data
-        box_orientations: List to store orientation data
-        
-    Returns:
-        tuple: (position, orientation) where position is [x, y, z] and orientation is [roll, pitch, yaw]
-    """
-    # Get the box body
-    box_body = plant.GetBodyByName("box_link", box_id)
-    
-    # Get the pose of the box body in world frame using Drake's EvalBodyPoseInWorld
-    X_WB = plant.EvalBodyPoseInWorld(plant_context, box_body)
-    
-    # Extract position (translation)
-    position = X_WB.translation()
-    pos = [position[0], position[1], position[2]]
-    
-    # Extract orientation (rotation) as roll, pitch, yaw
-    rotation = X_WB.rotation()
-    roll_pitch_yaw = rotation.ToRollPitchYaw()
-    rpy = roll_pitch_yaw.vector()
-    orientation = [rpy[0], rpy[1], rpy[2]]
-    
-    # Collect data if requested
-    if collect_data and box_positions is not None and box_orientations is not None:
-        box_positions.append(pos)
-        box_orientations.append(orientation)
-    
-    return pos, orientation
 
 ####################################
 # Run Simple Simulation
@@ -468,10 +496,6 @@ if simulate:
     sim_time = trajDuration_  # or whatever your total simulation time is
     simulator_context = simulator.get_mutable_context()
 
-    # Lists to store box position data
-    box_positions = []
-    box_orientations = []
-
     print(f"Starting simulation for {sim_time} seconds...")
     print(f"Initial positions: {trajInit_}")
     print("Using Relaxed IK to track box position!")
@@ -480,22 +504,11 @@ if simulate:
     while simulator_context.get_time() < sim_time:
          next_time = min(sim_time, simulator_context.get_time() + kStep)
          simulator.AdvanceTo(next_time)
-         
-         # Track box position at each step using Drake's EvalBodyPoseInWorld
-         current_time = simulator_context.get_time()
-         pos, orientation = get_box_pose_in_world(plant, plant_context, box_id, collect_data=True, box_positions=box_positions, box_orientations=box_orientations)
 
     print("Simulation completed!")
     
-    # Convert to numpy arrays for easier plotting
-    box_positions = np.array(box_positions)
-    box_orientations = np.array(box_orientations)
+    # Evaluate and print the final pose of the movable box
 
-    # Print initial and final box positions
-    print(f"Initial box position: {box_positions[0]}")
-    print(f"Final box position: {box_positions[-1]}")
-    print(f"Initial box orientation: {box_orientations[0]}")
-    print(f"Final box orientation: {box_orientations[-1]}")
     
     # Record and publish MeshCat visualization
     if meshcat_visualisation:
@@ -529,6 +542,9 @@ log_tau = logger_tau.FindLog(diagram_context)
 log_qv = logger_qv.FindLog(diagram_context)
 log_qr = logger_qr.FindLog(diagram_context)
 log_box_pos = logger_box_pos.FindLog(diagram_context)
+log_box_poses = logger_box_poses.FindLog(diagram_context)
+log_energy = logger_energy.FindLog(diagram_context)
+log_contact_forces = logger_contact_forces.FindLog(diagram_context)
 
 t_time = log_x.sample_times()
 
@@ -538,8 +554,40 @@ data_tau = log_tau.data().transpose()  # Selecting only the first 7 columns (joi
 data_qv = log_qv.data().transpose()  # Selecting only the first 7 columns (joints)
 data_qr = log_qr.data().transpose()  # Selecting only the first 7 columns (joints)
 data_box_pos = log_box_pos.data().transpose() # box position
+data_box_poses = log_box_poses.data().transpose() # box poses (all bodies)
+data_energy = log_energy.data().transpose() # system energy
+data_contact_forces = log_contact_forces.data().transpose() # contact forces
 
-# print(t_time)
+# Print the last values of joint positions from logger data
+print(f"\n=== Final Joint Positions ===")
+print(f"Joint positions at end of simulation:")
+print(f"Final joint positions: {data_q[-1, :]}")
+print("=" * 30)
+
+# Get body poses at the end of simulation using the last joint positions from logger
+print(f"\n=== Final Body Poses (using logged joint positions) ===")
+try:
+    # Set the plant to the final joint positions from logger
+    final_joint_positions = data_q[-1, :]
+    plant.SetPositions(plant_context, panda_id, final_joint_positions)
+    
+    # Get panda_link7 pose
+    panda_link7_body = plant.GetBodyByName("panda_link7")
+    panda_link7_pose = plant.EvalBodyPoseInWorld(plant_context, panda_link7_body)
+    panda_link7_translation = panda_link7_pose.translation()
+    
+    # Get panda_hand pose
+    panda_hand_body = plant.GetBodyByName("panda_hand")
+    panda_hand_pose = plant.EvalBodyPoseInWorld(plant_context, panda_hand_body)
+    panda_hand_translation = panda_hand_pose.translation()
+    
+    print(f"panda_link7 translation: {panda_link7_translation}")
+    print(f"panda_hand translation: {panda_hand_translation}")
+    print("=" * 30)
+    
+except Exception as e:
+    print(f"Error getting final body poses: {e}")
+
 # Identify modified joints (where values differ)
 modified_indices = np.where(trajInit_ != trajEnd_)[0]
 
@@ -615,18 +663,29 @@ axs_tau[-1].set_xlabel('Time [s]')
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
-# Create a figure for box position plots
-fig_box_pos, axs_box_pos = plt.subplots(1, 1, figsize=(12, 3))
-fig_box_pos.suptitle('Box Position')
+# Create a figure for box poses (all bodies)
+fig_box_poses, axs_box_poses = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+fig_box_poses.suptitle('Movable Box Position (XYZ)')
 
-axs_box_pos.plot(t_time, data_box_pos[:, 0], label='Box X Position', linestyle='-')
-axs_box_pos.plot(t_time, data_box_pos[:, 1], label='Box Y Position', linestyle='--')
-axs_box_pos.plot(t_time, data_box_pos[:, 2], label='Box Z Position', linestyle=':')
-axs_box_pos.set_ylabel('Position [m]')
-axs_box_pos.grid(True)
-axs_box_pos.set_xlim([t_time[1], t_time[-1]])
-axs_box_pos.legend(loc='upper right')
-axs_box_pos.set_xlabel('Time [s]')
+# The state data contains: [quaternion_w, quaternion_x, quaternion_y, quaternion_z, position_x, position_y, position_z]
+# Extract positions only
+position_data = data_box_poses[:, 4:7]    # Next 3 elements are spatial position
+
+# Plot positions
+axs_box_poses[0].plot(t_time, position_data[:, 0], label='Position X', linestyle='-', color='red')
+axs_box_poses[1].plot(t_time, position_data[:, 1], label='Position Y', linestyle='-', color='green')
+axs_box_poses[2].plot(t_time, position_data[:, 2], label='Position Z', linestyle='-', color='blue')
+
+axs_box_poses[0].set_ylabel('X Position [m]')
+axs_box_poses[1].set_ylabel('Y Position [m]')
+axs_box_poses[2].set_ylabel('Z Position [m]')
+axs_box_poses[2].set_xlabel('Time [s]')
+
+for ax in axs_box_poses:
+    ax.grid(True)
+    ax.legend(loc='upper right')
+    ax.set_xlim([t_time[1], t_time[-1]])
+
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
@@ -715,3 +774,71 @@ print("-" * 50)
 print(f"Overall\t\t{overall_rms:.4f}\t\t{overall_max:.4f}")
 
 # Block diagram generation removed - not needed
+
+# Create a figure for system energy
+fig_energy, axs_energy = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+fig_energy.suptitle('System Energy')
+
+# Plot total energy
+axs_energy[0].plot(t_time, data_energy[:, 0], label='Total Energy', linestyle='-', color='blue')
+axs_energy[0].set_ylabel('Energy [J]')
+axs_energy[0].grid(True)
+axs_energy[0].legend(loc='upper right')
+
+# Plot kinetic and potential energy if available
+if data_energy.shape[1] > 1:
+    axs_energy[1].plot(t_time, data_energy[:, 1], label='Kinetic Energy', linestyle='-', color='red')
+    axs_energy[1].plot(t_time, data_energy[:, 2], label='Potential Energy', linestyle='-', color='green')
+    axs_energy[1].set_ylabel('Energy [J]')
+    axs_energy[1].grid(True)
+    axs_energy[1].legend(loc='upper right')
+
+axs_energy[-1].set_xlabel('Time [s]')
+axs_energy[-1].set_xlim([t_time[1], t_time[-1]])
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# Create a figure for contact forces
+fig_contact, axs_contact = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+fig_contact.suptitle('Contact Forces')
+
+# Plot contact forces (assuming first 3 components are x, y, z forces)
+if data_contact_forces.shape[1] >= 3:
+    axs_contact[0].plot(t_time, data_contact_forces[:, 0], label='Contact Force X', linestyle='-', color='red')
+    axs_contact[1].plot(t_time, data_contact_forces[:, 1], label='Contact Force Y', linestyle='-', color='green')
+    axs_contact[2].plot(t_time, data_contact_forces[:, 2], label='Contact Force Z', linestyle='-', color='blue')
+    
+    axs_contact[0].set_ylabel('Force X [N]')
+    axs_contact[1].set_ylabel('Force Y [N]')
+    axs_contact[2].set_ylabel('Force Z [N]')
+    
+    for ax in axs_contact:
+        ax.grid(True)
+        ax.legend(loc='upper right')
+        ax.set_xlim([t_time[1], t_time[-1]])
+    
+    axs_contact[2].set_xlabel('Time [s]')
+else:
+    # If contact forces data structure is different, plot all available components
+    for i in range(min(3, data_contact_forces.shape[1])):
+        axs_contact[i].plot(t_time, data_contact_forces[:, i], label=f'Contact Force {i+1}', linestyle='-')
+        axs_contact[i].set_ylabel(f'Force {i+1} [N]')
+        axs_contact[i].grid(True)
+        axs_contact[i].legend(loc='upper right')
+        axs_contact[i].set_xlim([t_time[1], t_time[-1]])
+    
+    axs_contact[2].set_xlabel('Time [s]')
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# Print summary statistics for energy and contact forces
+print("\n=== Energy and Contact Forces Summary ===")
+print(f"Final total energy: {data_energy[-1, 0]:.4f} J")
+if data_energy.shape[1] > 1:
+    print(f"Final kinetic energy: {data_energy[-1, 1]:.4f} J")
+    print(f"Final potential energy: {data_energy[-1, 2]:.4f} J")
+
+print(f"Max contact force magnitude: {np.max(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
+print(f"Average contact force magnitude: {np.mean(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
