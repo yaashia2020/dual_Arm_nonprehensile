@@ -98,13 +98,17 @@ class ExplicitReferenceGovernor:
         self.dq_pred_list_ = np.zeros((self.num_velocities, self.num_pred_samples_ + 1))
         self.tau_pred_list_ = np.zeros((self.plant_pred.get_actuation_input_port().size(), self.num_pred_samples_ + 1))
         
+        # Arrays to store body poses (translation part) for each prediction step
+        # Store poses for all 7 links (panda_link1 to panda_link7) for each prediction step
+        self.body_pose_list_ = np.zeros((7, 3, self.num_pred_samples_ + 1))  # 7 links, 3 coordinates (X,Y,Z), prediction steps
+        
         # Limits for joint angles, velocities, and torques
         self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
         self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
         self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
         self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
         self.limit_dp_EE_ = [1.7, 2.5]  # Translation and rotation limits for the end effector
-        self.E_max_ = 10.0  # Maximum energy limit
+        self.E_max_ = 3.0  # Maximum energy limit
 
     def get_qv(self, q, dq, tau, q_r, q_v, box_position=None):
         """
@@ -187,7 +191,7 @@ class ExplicitReferenceGovernor:
     def soft_navigation_field(self, box_position_constraint, q_v):
         """
         Compute soft navigation field based on box position constraint.
- 
+
         """
         # Define parameters (you can adjust these)
         delta_s = 0.1  # Safety distance
@@ -355,6 +359,36 @@ class ExplicitReferenceGovernor:
         self.dq_pred_list_[:, 0] = dq_pred
         self.tau_pred_list_[:, 0] = tau_pred
         
+        # Calculate and store initial body pose
+        try:
+            # Set plant to initial q_pred
+            self.plant_pred.SetPositions(self.plant_context, q_pred)  # Remove model_instance parameter
+            
+            # Define link range (similar to C++ code)
+            init_link_id = 1  # Start from panda_link1
+            final_link_id = 7  # End at panda_link7
+            s = final_link_id - init_link_id + 1  # Total number of links
+            
+            # Initialize plant_positions matrix (3 x s)
+            plant_positions = np.zeros((3, s))
+            
+            # Calculate poses for all joints from init_link_id to final_link_id
+            for j in range(init_link_id, final_link_id + 1):
+                body_name = f"panda_link{j}"
+                body = self.plant_pred.GetBodyByName(body_name)
+                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
+                
+                # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
+                plant_positions[:, j - init_link_id] = plant_joint_position
+            
+            # Store all link poses in body_pose_list_
+            for link_idx in range(7):
+                self.body_pose_list_[link_idx, :, 0] = plant_positions[:, link_idx]
+                
+        except Exception as e:
+            print(f"Initial body pose calculation failed: {e}")
+            self.body_pose_list_[:, :, 0] = 0.0
+
         for k in range(self.num_pred_samples_):
         
 
@@ -381,7 +415,7 @@ class ExplicitReferenceGovernor:
 
             # Solve for x[k+1] using the computed tau_pred
             
-            state_pred = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
+            state_pred, body_pose_translation = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
             q_pred = state_pred[:self.num_positions]
             dq_pred = state_pred[self.num_positions:]
 
@@ -395,7 +429,12 @@ class ExplicitReferenceGovernor:
             self.q_pred_list_[:, k + 1] = q_pred
             self.dq_pred_list_[:, k + 1] = dq_pred
             self.tau_pred_list_[:, k + 1] = tau_pred
-            # print(f"TIme taken to predict one sample = {(time.time() - start_time)*1000} ms")
+            
+            # Store body pose from calc_dynamics return
+            # body_pose_translation contains poses for all 7 links
+            # Store in body_pose_list_ for this prediction step
+            for link_idx in range(7):
+                self.body_pose_list_[link_idx, :, k + 1] = body_pose_translation[:, link_idx]
 
         # Convert lists to arrays for plotting
         q_pred_traj = np.array(q_pred_traj)
@@ -436,7 +475,7 @@ class ExplicitReferenceGovernor:
             qv: Desired position vector.
         
         Returns:
-            The next state vector.
+            Tuple containing (next_state, body_pose_translation).
         """
         # Set the discrete state directly
         state = self.plant_context.get_mutable_state()
@@ -479,9 +518,37 @@ class ExplicitReferenceGovernor:
 
         x_next = np.concatenate([q_next, dq_next])
         
-        # print(x_next)
-        # print(f"x - x_next = {x - x_next}")
-        return x_next
+        # Calculate body pose using current q_pred (q) for all joints
+        try:
+            # Set plant to current joint positions
+            # self.plant_pred.SetPositions(self.plant_context, 0, q)  # Assuming model instance 0
+            
+            # Define link range (similar to C++ code)
+            init_link_id = 1  # Start from panda_link1
+            final_link_id = 7  # End at panda_link7
+            s = final_link_id - init_link_id + 1  # Total number of links
+            
+            # Initialize plant_positions matrix (3 x s)
+            plant_positions = np.zeros((3, s))
+            
+            # Calculate poses for all joints from init_link_id to final_link_id
+            for j in range(init_link_id, final_link_id + 1):
+                body_name = f"panda_link{j}"
+                body = self.plant_pred.GetBodyByName(body_name)
+                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
+                
+                # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
+                plant_positions[:, j - init_link_id] = plant_joint_position
+            
+            # Return all link poses
+            body_pose_translation = plant_positions
+            
+        except Exception as e:
+            print(f"Body pose calculation failed in calc_dynamics: {e}")
+            body_pose_translation = np.zeros((3, 7))  # Return 3x7 matrix for 7 links
+        
+        # Return both next state and body pose translation
+        return x_next, body_pose_translation
 
 
     def dsmTau(self):
@@ -551,7 +618,7 @@ class ExplicitReferenceGovernor:
         """
         for k in range(self.q_pred_list_.shape[1]):  # number of prediction samples + 1
             q_pred = self.q_pred_list_[:, k]
-            DSM_s_temp = self.calculateDsmS(box_position, q_pred) - self.robust_delta_q_  # Use robust_delta_q_ for distance safety margin
+            DSM_s_temp = self.calculateDsmS(box_position, k)  # Use robust_delta_q_ for distance safety margin
             if k == 0:
                 DSM_s = DSM_s_temp
             else:
@@ -569,33 +636,22 @@ class ExplicitReferenceGovernor:
         DSM_energy = max(kappaS * dsm_s, kappaE * (self.E_max_ - total_energy))
         return DSM_energy
 
-    def calculateDsmS(self, box_position, q_pred=None):
+    def calculateDsmS(self, box_position, k):
         """
         Calculate DSM_s based on distance between robot links and tracked object.
-        Uses the passed box position parameter and predicted joint positions.
+
         """
         if box_position is None:
             return float('inf')
         
-        # Get robot link positions from current plant state
-        init_link_id = 1  # Start from first robot link
-        final_link_id = 7  # End at last robot link
-        
-        plant_positions = []
-        
-        # Get positions of robot links from current plant context
-        for j in range(init_link_id, final_link_id + 1):
-            body_name = f"panda_link{j}"
-            body = self.plant_pred.GetBodyByName(body_name)
-            body_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body)
-            link_position = body_pose.translation()
-            plant_positions.append(link_position)
-        
-        if not plant_positions:
+
+        if self.body_pose_list_.shape[2] > 0:  # Check if we have stored positions
+            # Use the first prediction step (index 0) for current positions
+            plant_positions = self.body_pose_list_[:, :, k]  # Shape: (7, 3) - 7 links, 3 coordinates
+            plant_positions = plant_positions.T  # Transpose to get (3, 7) format
+        else:
+            # Fallback: return infinite if no stored positions
             return float('inf')
-        
-        # Convert to numpy array
-        plant_positions = np.array(plant_positions).T  # 3 x num_links
         
         # Define constraint vector
         c = np.array([-1.0, 0.0, 0.0])  # Vector c = [-1, 0, 0]

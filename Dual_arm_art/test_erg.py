@@ -59,7 +59,7 @@ def create_system_model(plant, scene_graph):
     # Position the movable box above the fixed box after plant is finalized
     # The fixed box is at Z=0.55 with height 0.1, so place movable box at Z=0.65
     plant_context = plant.CreateDefaultContext()
-    initial_box_position = RigidTransform(p=[0.7, 0.0, 0.2])  # Positioned just above the fixed box
+    initial_box_position = RigidTransform(p=[0.6, 0.0, 0.2])  # Positioned just above the fixed box
     plant.SetFreeBodyPose(plant_context, plant.GetBodyByName("box_link", movable_box_id), initial_box_position)
     
     # Set default positions for the robot (not the box)
@@ -144,8 +144,8 @@ class RelaxedIKBoxTracker(LeafSystem):
             box_state = self._box_state_port.Eval(context)
             box_pos = box_state[4:7]  # Extract position values (X, Y, Z) from 13-element state
             
-            # Use box position directly as target (no offset)
-            target_position = [box_pos[0], box_pos[1], box_pos[2]]
+            # Use box position with an x-offset of -0.11 as target (post-processing adjustment)
+            target_position = [box_pos[0] - 0.11, box_pos[1], box_pos[2]]
             
             try:
                 # Solve IK with default orientation
@@ -275,7 +275,9 @@ class ERG(LeafSystem):
         tau = self._tau_port.Eval(context)
         q_r = self._qr_port.Eval(context)
         box_state = self._box_state_port.Eval(context)
-        box_position = box_state[4:7]  # Extract position values (X, Y, Z) from 13-element state
+        # Extract and post-process box position (subtract 0.11 from x)
+        box_position = np.array(box_state[4:7], dtype=float)
+        box_position[0] -= 0.11
 
         self.q_v = context.get_discrete_state_vector().CopyToVector()              
         # Initialize q_v_ only at the first callback
@@ -368,14 +370,23 @@ class ContactForceConverter(LeafSystem):
         num_contacts = contact_results.num_point_pair_contacts()
         print(f"Total contacts detected: {num_contacts}")
         
-        # Define robot links to check for contacts
-        robot_links = ["panda_link1", "panda_link2", "panda_link3", "panda_link4", 
-                      "panda_link5", "panda_link6", "panda_link7", "panda_hand"]
+        # Define robot links to check for contacts - including all hand components
+        robot_links = [
+            "panda_link1", "panda_link2", "panda_link3", "panda_link4", 
+            "panda_link5", "panda_link6", "panda_link7", 
+            "panda_hand", "panda_finger_joint1", "panda_finger_joint2",
+            "panda_leftfinger", "panda_rightfinger"
+        ]
         object_name = "box_link"
         
         # Sum up all contact forces between robot and box
         total_force = [0.0, 0.0, 0.0]
         robot_box_contacts = 0
+        
+        # Track contacts by component type
+        arm_contacts = 0
+        hand_contacts = 0
+        finger_contacts = 0
         
         for i in range(num_contacts):
             contact_info = contact_results.point_pair_contact_info(i)
@@ -396,12 +407,27 @@ class ContactForceConverter(LeafSystem):
                 force = contact_info.contact_force()
                 print(f"  Robot-Box contact detected! Force: [{force[0]:.3f}, {force[1]:.3f}, {force[2]:.3f}]")
                 
+                # Categorize contact type
+                contact_body = bodyA_name if bodyA_name in robot_links else bodyB_name
+                if "finger" in contact_body:
+                    finger_contacts += 1
+                    print(f"    -> Finger contact detected on {contact_body}")
+                elif contact_body == "panda_hand":
+                    hand_contacts += 1
+                    print(f"    -> Hand contact detected on {contact_body}")
+                else:
+                    arm_contacts += 1
+                    print(f"    -> Arm link contact detected on {contact_body}")
+                
                 # Extract contact force and add to total
                 total_force[0] += force[0]
                 total_force[1] += force[1]
                 total_force[2] += force[2]
         
         print(f"Robot-Box contacts: {robot_box_contacts}")
+        print(f"  - Arm link contacts: {arm_contacts}")
+        print(f"  - Hand contacts: {hand_contacts}")
+        print(f"  - Finger contacts: {finger_contacts}")
         print(f"Total force: [{total_force[0]:.3f}, {total_force[1]:.3f}, {total_force[2]:.3f}]")
         
         # Set the total contact force
@@ -469,12 +495,58 @@ logger_qv = LogVectorOutput(erg_system.GetOutputPort("q_v_filtered"), builder) #
 logger_qr = LogVectorOutput(ik_box_tracker.GetOutputPort("ik_joint_targets"), builder) #ik targets
 logger_box_pos = LogVectorOutput(plant.get_state_output_port(box_id), builder) #box position
 
-# Add logger for movable box body poses
-logger_box_poses = LogVectorOutput(plant.get_state_output_port(box_id), builder) #movable box poses only
-
 # Add loggers for energy and contact forces
 logger_energy = LogVectorOutput(erg_system.GetOutputPort("calculated_energy"), builder) #calculated energy from ERG
 logger_contact_forces = LogVectorOutput(contact_force_converter.GetOutputPort("contact_forces"), builder) #contact forces between robot and box
+
+# Create a LeafSystem to extract panda_link7 world positions from joint states
+class PandaLink7PoseExtractor(LeafSystem):
+    def __init__(self, plant, panda_id):
+        super().__init__()
+        self.plant = plant
+        self.panda_id = panda_id
+        
+        # Input port for joint positions (9 joints: 7 robot + 2 gripper)
+        self.DeclareVectorInputPort("joint_positions", size=18)
+        
+        # Output port for panda_link7 world positions (X, Y, Z)
+        self.DeclareVectorOutputPort("panda_link7_world_positions", size=3, calc=self.CalcOutput)
+        
+        # Create a temporary context for pose evaluation
+        self.temp_context = plant.CreateDefaultContext()
+    
+    def CalcOutput(self, context, output):
+        # Get joint positions from input port (18-element state: 9 positions + 9 velocities)
+        full_state = self.GetInputPort("joint_positions").Eval(context)
+        
+        # Extract only joint positions (first 9 elements)
+        joint_positions = full_state[:9]
+        
+        # Set the plant to these joint positions in temporary context
+        self.plant.SetPositions(self.temp_context, self.panda_id, joint_positions)
+        
+        # Get panda_link7 body
+        panda_link7_body = self.plant.GetBodyByName("panda_link7")
+        
+        # Evaluate panda_link7 world pose using EvalBodyPoseInWorld
+        panda_link7_pose = self.plant.EvalBodyPoseInWorld(self.temp_context, panda_link7_body)
+        
+        # Extract translation (X, Y, Z positions)
+        translation = panda_link7_pose.translation()
+        
+        # Set output to world positions
+        output.SetFromVector([translation[0], translation[1], translation[2]])
+
+# Add PandaLink7PoseExtractor to the diagram
+panda_link7_extractor = builder.AddNamedSystem("PandaLink7PoseExtractor", 
+                                              PandaLink7PoseExtractor(plant, panda_id))
+
+# Connect robot joint states to PandaLink7PoseExtractor
+builder.Connect(plant.get_state_output_port(panda_id), 
+               panda_link7_extractor.GetInputPort("joint_positions"))
+
+# Add logger for panda_link7 world positions from extractor
+logger_panda_link7_world = LogVectorOutput(panda_link7_extractor.GetOutputPort("panda_link7_world_positions"), builder)
 
 # Finalize the diagram
 diagram = builder.Build()
@@ -542,9 +614,9 @@ log_tau = logger_tau.FindLog(diagram_context)
 log_qv = logger_qv.FindLog(diagram_context)
 log_qr = logger_qr.FindLog(diagram_context)
 log_box_pos = logger_box_pos.FindLog(diagram_context)
-log_box_poses = logger_box_poses.FindLog(diagram_context)
 log_energy = logger_energy.FindLog(diagram_context)
 log_contact_forces = logger_contact_forces.FindLog(diagram_context)
+log_panda_link7_world = logger_panda_link7_world.FindLog(diagram_context)
 
 t_time = log_x.sample_times()
 
@@ -554,9 +626,20 @@ data_tau = log_tau.data().transpose()  # Selecting only the first 7 columns (joi
 data_qv = log_qv.data().transpose()  # Selecting only the first 7 columns (joints)
 data_qr = log_qr.data().transpose()  # Selecting only the first 7 columns (joints)
 data_box_pos = log_box_pos.data().transpose() # box position
-data_box_poses = log_box_poses.data().transpose() # box poses (all bodies)
 data_energy = log_energy.data().transpose() # system energy
 data_contact_forces = log_contact_forces.data().transpose() # contact forces
+data_panda_link7_world = log_panda_link7_world.data().transpose() # panda_link7 world positions
+
+# Extract panda_link7 positions using the new PoseExtractor system
+print("Extracting panda_link7 positions using PandaLink7PoseExtractor...")
+print(f"Panda link7 world positions data shape: {data_panda_link7_world.shape}")
+
+# The new system directly gives us X, Y, Z positions
+# data_panda_link7_world shape: [time_steps, 3] where 3 = [X, Y, Z]
+panda_link7_positions = data_panda_link7_world
+
+print(f"panda_link7 positions shape: {panda_link7_positions.shape}")
+print(f"Sample panda_link7 positions: {panda_link7_positions[:5]}")
 
 # Print the last values of joint positions from logger data
 print(f"\n=== Final Joint Positions ===")
@@ -587,6 +670,37 @@ try:
     
 except Exception as e:
     print(f"Error getting final body poses: {e}")
+
+# Create a figure for panda_link7 world positions
+fig_panda_link7, axs_panda_link7 = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+fig_panda_link7.suptitle('Panda Link7 World Positions (XYZ) - Direct Pose Extraction')
+
+# Plot panda_link7 positions
+axs_panda_link7[0].plot(t_time, panda_link7_positions[:, 0], label='Position X', linestyle='-', color='red', linewidth=2)
+axs_panda_link7[1].plot(t_time, panda_link7_positions[:, 1], label='Position Y', linestyle='-', color='green', linewidth=2)
+axs_panda_link7[2].plot(t_time, panda_link7_positions[:, 2], label='Position Z', linestyle='-', color='blue', linewidth=2)
+
+axs_panda_link7[0].set_ylabel('X Position [m]')
+axs_panda_link7[1].set_ylabel('Y Position [m]')
+axs_panda_link7[2].set_ylabel('Z Position [m]')
+axs_panda_link7[2].set_xlabel('Time [s]')
+
+for ax in axs_panda_link7:
+    ax.grid(True)
+    ax.legend(loc='upper right')
+    ax.set_xlim([t_time[1], t_time[-1]])
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# Print summary statistics for panda_link7 positions
+print("\n=== Panda Link7 Position Summary (Direct Pose Extraction) ===")
+print(f"Initial position: [{panda_link7_positions[0, 0]:.4f}, {panda_link7_positions[0, 1]:.4f}, {panda_link7_positions[0, 2]:.4f}] m")
+print(f"Final position: [{panda_link7_positions[-1, 0]:.4f}, {panda_link7_positions[-1, 1]:.4f}, {panda_link7_positions[-1, 2]:.4f}] m")
+print(f"Total displacement: {np.linalg.norm(panda_link7_positions[-1] - panda_link7_positions[0]):.4f} m")
+print(f"X range: [{np.min(panda_link7_positions[:, 0]):.4f}, {np.max(panda_link7_positions[:, 0]):.4f}] m")
+print(f"Y range: [{np.min(panda_link7_positions[:, 1]):.4f}, {np.max(panda_link7_positions[:, 1]):.4f}] m")
+print(f"Z range: [{np.min(panda_link7_positions[:, 2]):.4f}, {np.max(panda_link7_positions[:, 2]):.4f}] m")
 
 # Identify modified joints (where values differ)
 modified_indices = np.where(trajInit_ != trajEnd_)[0]
@@ -669,7 +783,7 @@ fig_box_poses.suptitle('Movable Box Position (XYZ)')
 
 # The state data contains: [quaternion_w, quaternion_x, quaternion_y, quaternion_z, position_x, position_y, position_z]
 # Extract positions only
-position_data = data_box_poses[:, 4:7]    # Next 3 elements are spatial position
+position_data = data_box_pos[:, 4:7]    # Next 3 elements are spatial position
 
 # Plot positions
 axs_box_poses[0].plot(t_time, position_data[:, 0], label='Position X', linestyle='-', color='red')
