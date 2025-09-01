@@ -26,11 +26,15 @@ from trajectoryERG import ExplicitReferenceGovernor
 import os
 from pydrake.visualization import AddDefaultVisualization
 
+
 # Add Relaxed IK wrapper import
 import sys
 wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/relaxed_ik_core/wrappers"
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
+
+# Import FCL system from fcl_test.py
+from fcl_test import FCLLinkDistanceSystem
 
 # Remove the import since we'll define PD_gravity locally
 # from controllers.PID import PD_gravity
@@ -181,7 +185,7 @@ def create_dual_robot_system_model(plant, scene_graph):
     # Position the movable box above the fixed box after plant is finalized
     # The fixed box is at Z=0.55 with height 0.1, so place movable box at Z=0.65
     plant_context = plant.CreateDefaultContext()
-    initial_box_position = RigidTransform(p=[0.8, 0.0, 0.2])  # Positioned just above the fixed box
+    initial_box_position = RigidTransform(p=[0.85, 0.0, 0.2])  # Positioned just above the fixed box
     plant.SetFreeBodyPose(plant_context, plant.GetBodyByName("box_link", movable_box_id), initial_box_position)
     
     # Set default positions for both robots
@@ -208,9 +212,9 @@ def create_dual_robot_system_model(plant, scene_graph):
 ####################################
 contact_model = ContactModel.kHydroelasticWithFallback  # Options: Hydroelastic, Point, or HydroelasticWithFallback
 mesh_type = HydroelasticContactRepresentation.kTriangle  # Options: Triangle or Polygon
-discrete_solver = DiscreteContactApproximation.kTamsi # Options:kTamsi, kSap, kLagged, kSimilar
+discrete_solver = DiscreteContactApproximation.kSap # Options:kTamsi, kSap, kLagged, kSimilar
 realtime_factor = 1  # Real-time factor for simulation speed
-time_step = 0.001
+time_step = 0.0005
 
 meshcat_visualisation = True
 simulate = True
@@ -383,27 +387,18 @@ class DualRelaxedIKBoxTracker(LeafSystem):
 #              ##################Contact Force Converter################
 ######################################################################################################
 class DualContactForceConverter(LeafSystem):
-    def __init__(self, plant):
+    def __init__(self, plant, scene_graph, panda1_id, panda2_id):
         super().__init__()
         
         self.plant = plant
+        self.scene_graph = scene_graph
+        self.panda1_id = panda1_id
+        self.panda2_id = panda2_id
         self.DeclareAbstractInputPort("contact_results", AbstractValue.Make(ContactResults()))
         self.DeclareVectorOutputPort("contact_forces", size=6, calc=self.CalcOutput)  # 3 for each robot
         
-        # Define robot links for both robots
-        self.robot1_links = [
-            "panda_link1", "panda_link2", "panda_link3", "panda_link4",
-            "panda_link5", "panda_link6", "panda_link7",
-            "panda_hand", "panda_finger_joint1", "panda_finger_joint2",
-            "panda_leftfinger", "panda_rightfinger"
-        ]
-        
-        self.robot2_links = [
-            "panda_1_link1", "panda_1_link2", "panda_1_link3", "panda_1_link4",
-            "panda_1_link5", "panda_1_link6", "panda_1_link7",
-            "panda_1_hand", "panda_1_finger_joint1", "panda_1_finger_joint2",
-            "panda_1_leftfinger", "panda_1_rightfinger"
-        ]
+        # Store the robot model instance IDs for contact detection
+        # We'll use body names to identify which robot each contact involves
         
         # Contact categorization
         self.robot1_contacts = 0
@@ -428,14 +423,22 @@ class DualContactForceConverter(LeafSystem):
             body_a_name = self.plant.get_body(body_a).name()
             body_b_name = self.plant.get_body(body_b).name()
             
-            # Check if contact involves robot 1
-            if body_a_name in self.robot1_links or body_b_name in self.robot1_links:
+            # Check if contact involves robot 1 (panda)
+            if "panda" in body_a_name.lower() and "panda_1" not in body_a_name.lower():
+                force = contact_info.contact_force()
+                robot1_force += np.array([force[0], force[1], force[2]])
+                self.robot1_contacts += 1
+            elif "panda" in body_b_name.lower() and "panda_1" not in body_b_name.lower():
                 force = contact_info.contact_force()
                 robot1_force += np.array([force[0], force[1], force[2]])
                 self.robot1_contacts += 1
             
-            # Check if contact involves robot 2
-            if body_a_name in self.robot2_links or body_b_name in self.robot2_links:
+            # Check if contact involves robot 2 (panda_1)
+            elif "panda_1" in body_a_name.lower():
+                force = contact_info.contact_force()
+                robot2_force += np.array([force[0], force[1], force[2]])
+                self.robot2_contacts += 1
+            elif "panda_1" in body_b_name.lower():
                 force = contact_info.contact_force()
                 robot2_force += np.array([force[0], force[1], force[2]])
                 self.robot2_contacts += 1
@@ -443,6 +446,8 @@ class DualContactForceConverter(LeafSystem):
         # Combine forces for output (6 values: [robot1_x, robot1_y, robot1_z, robot2_x, robot2_y, robot2_z])
         combined_forces = np.concatenate([robot1_force, robot2_force])
         output.SetFromVector(combined_forces)
+        
+
 
 ######################################################################################################
 #              ##################Panda Link7 Pose Extractor for Both Robots################
@@ -490,6 +495,84 @@ class DualPandaLink7PoseExtractor(LeafSystem):
                              combined_translation[3], combined_translation[4], combined_translation[5]])
 
 ######################################################################################################
+#              ##################Robot Link Index Accessor################
+######################################################################################################
+class RobotLinkIndexAccessor(LeafSystem):
+    """
+    Provides access to body indexes and link information for both robots.
+    Useful for getting specific link indexes like panda_link7 for both robots.
+    """
+    def __init__(self, plant, panda1_id, panda2_id):
+        super().__init__()
+        self.plant = plant
+        self.panda1_id = panda1_id
+        self.panda2_id = panda2_id
+        
+        # Output port for link indexes (2 values: [robot1_link7_idx, robot2_link7_idx])
+        self.DeclareVectorOutputPort("link7_indexes", size=2, calc=self.CalcOutput)
+        
+        # Get the body indexes for panda_link7 of both robots
+        self._get_link_indexes()
+    
+    def _get_link_indexes(self):
+        """Get the body indexes for panda_link7 of both robots."""
+        try:
+            # Get panda_link7 body for robot 1
+            self.robot1_link7_body = self.plant.GetBodyByName("panda_link7", self.panda1_id)
+            self.robot1_link7_index = self.robot1_link7_body.index()
+            
+            # Get panda_link7 body for robot 2
+            self.robot2_link7_body = self.plant.GetBodyByName("panda_link7", self.panda2_id)
+            self.robot2_link7_index = self.robot2_link7_body.index()
+            
+            print(f"Robot 1 panda_link7 body index: {self.robot1_link7_index}")
+            print(f"Robot 2 panda_link7 body index: {self.robot2_link7_index}")
+            
+        except Exception as e:
+            print(f"Error getting link indexes: {e}")
+            self.robot1_link7_index = -1
+            self.robot2_link7_index = -1
+    
+    def CalcOutput(self, context, output):
+        """Output the link7 indexes for both robots."""
+        indexes = [self.robot1_link7_index, self.robot2_link7_index]
+        output.SetFromVector(indexes)
+    
+    def get_robot1_link7_index(self):
+        """Get the body index for robot 1's panda_link7."""
+        return self.robot1_link7_index
+    
+    def get_robot2_link7_index(self):
+        """Get the body index for robot 2's panda_link7."""
+        return self.robot2_link7_index
+    
+    def get_robot1_link7_body(self):
+        """Get the body object for robot 1's panda_link7."""
+        return self.robot1_link7_body
+    
+    def get_robot2_link7_body(self):
+        """Get the body object for robot 2's panda_link7."""
+        return self.robot2_link7_body
+    
+    def get_all_link_info(self):
+        """Get comprehensive link information for both robots."""
+        info = {
+            'robot1': {
+                'model_id': self.panda1_id,
+                'link7_body': self.robot1_link7_body,
+                'link7_index': self.robot1_link7_index,
+                'link7_name': 'panda_link7'
+            },
+            'robot2': {
+                'model_id': self.panda2_id,
+                'link7_body': self.robot2_link7_body,
+                'link7_index': self.robot2_link7_index,
+                'link7_name': 'panda_link7'
+            }
+        }
+        return info
+
+######################################################################################################
 #              ##################Main System Setup################
 ######################################################################################################
 
@@ -519,8 +602,14 @@ ik_splitter = builder.AddSystem(IKSplitter())
 erg1 = builder.AddSystem(ERG())
 erg2 = builder.AddSystem(ERG())
 
-dual_contact_converter = builder.AddSystem(DualContactForceConverter(plant))
+dual_contact_converter = builder.AddSystem(DualContactForceConverter(plant, scene_graph, panda1_id, panda2_id))
 dual_pose_extractor = builder.AddSystem(DualPandaLink7PoseExtractor(plant, panda1_id, panda2_id))
+link_index_accessor = builder.AddSystem(RobotLinkIndexAccessor(plant, panda1_id, panda2_id))
+
+# Add FCL distance systems for both robots
+fcl_robot1 = builder.AddSystem(FCLLinkDistanceSystem(plant, panda1_id, movable_box_id))
+fcl_robot2 = builder.AddSystem(FCLLinkDistanceSystem(plant, panda2_id, movable_box_id))
+
 
 # Add PID controllers for both robots
 Kp1 = 15 * np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120.0, 120.0])  # 9 joints
@@ -555,6 +644,17 @@ contact_logger.set_name("contact_logger")
 
 pose_logger = LogVectorOutput(dual_pose_extractor.GetOutputPort("panda_link7_world_positions"), builder)
 pose_logger.set_name("pose_logger")
+
+link_index_logger = LogVectorOutput(link_index_accessor.GetOutputPort("link7_indexes"), builder)
+link_index_logger.set_name("link_index_logger")
+
+# Add FCL distance loggers for both robots
+fcl_logger1 = LogVectorOutput(fcl_robot1.get_output_port(0), builder)
+fcl_logger1.set_name("fcl_logger1")
+fcl_logger2 = LogVectorOutput(fcl_robot2.get_output_port(0), builder)
+fcl_logger2.set_name("fcl_logger2")
+
+
 
 # Connect all systems
 # Box state to IK tracker
@@ -596,6 +696,12 @@ builder.Connect(plant.get_contact_results_output_port(), dual_contact_converter.
 builder.Connect(plant.get_state_output_port(panda1_id), dual_pose_extractor.GetInputPort("robot1_joint_positions"))
 builder.Connect(plant.get_state_output_port(panda2_id), dual_pose_extractor.GetInputPort("robot2_joint_positions"))
 
+# Connect plant state to FCL distance systems
+builder.Connect(plant.get_state_output_port(), fcl_robot1.GetInputPort("x"))
+builder.Connect(plant.get_state_output_port(), fcl_robot2.GetInputPort("x"))
+
+
+
 # Add visualization
 AddDefaultVisualization(builder=builder)
 
@@ -609,7 +715,7 @@ simulator.Initialize()
 
 # Run simulation
 print("Starting dual robot simulation...")
-simulator.AdvanceTo(30.0)  # Run for 30 seconds
+simulator.AdvanceTo(10.0) 
 
 print("Simulation completed!")
 
@@ -624,6 +730,9 @@ log_erg2 = erg_logger2.FindLog(diagram_context)
 log_box = box_pos_logger.FindLog(diagram_context)
 log_contact = contact_logger.FindLog(diagram_context)
 log_pose = pose_logger.FindLog(diagram_context)
+log_fcl1 = fcl_logger1.FindLog(diagram_context)
+log_fcl2 = fcl_logger2.FindLog(diagram_context)
+
 
 # Extract time data
 t_time = log_x1.sample_times()
@@ -651,17 +760,26 @@ data_contact_forces = log_contact.data().transpose()
 # Extract pose data for both robots
 data_pose = log_pose.data().transpose()
 
+# Extract FCL distance data for both robots
+data_fcl1 = log_fcl1.data().transpose()  # Robot 1 FCL distances (4 links)
+data_fcl2 = log_fcl2.data().transpose()  # Robot 2 FCL distances (4 links)
+
+
+
 print("\n=== Dual Robot Simulation Results ===")
 print(f"Robot 1 final joint positions: {data_q1[-1, :]}")
 print(f"Robot 2 final joint positions: {data_q2[-1, :]}")
 print(f"Box final position: {data_box_pos[-1, 4:7]}")  # x, y, z position
 print(f"Final contact forces - Robot 1: {data_contact_forces[-1, :3]}, Robot 2: {data_contact_forces[-1, 3:6]}")
+print(f"Final FCL distances - Robot 1: {data_fcl1[-1, :]} (link7, hand, leftfinger, rightfinger)")
+print(f"Final FCL distances - Robot 2: {data_fcl2[-1, :]} (link7, hand, leftfinger, rightfinger)")
+
 
 # Create plots for both robots
-plt.figure(figsize=(15, 10))
+plt.figure(figsize=(18, 12))
 
 # Robot 1 joint positions
-plt.subplot(2, 3, 1)
+plt.subplot(3, 3, 1)
 for i in range(9):  # All 9 joints (7 arm + 2 gripper)
     plt.plot(t_time, data_q1[:, i], label=f'Joint {i+1}')
 plt.title('Robot 1 Joint Positions')
@@ -671,7 +789,7 @@ plt.legend()
 plt.grid(True)
 
 # Robot 2 joint positions
-plt.subplot(2, 3, 2)
+plt.subplot(3, 3, 2)
 for i in range(9):  # All 9 joints (7 arm + 2 gripper)
     plt.plot(t_time, data_q2[:, i], label=f'Joint {i+1}')
 plt.title('Robot 2 Joint Positions')
@@ -681,7 +799,7 @@ plt.legend()
 plt.grid(True)
 
 # Box position
-plt.subplot(2, 3, 3)
+plt.subplot(3, 3, 3)
 box_positions = data_box_pos[:, 4:7]  # x, y, z
 plt.plot(t_time, box_positions[:, 0], label='X')
 plt.plot(t_time, box_positions[:, 1], label='Y')
@@ -693,7 +811,7 @@ plt.legend()
 plt.grid(True)
 
 # Robot 1 torques
-plt.subplot(2, 3, 4)
+plt.subplot(3, 3, 4)
 for i in range(9):  # All 9 joints (7 arm + 2 gripper)
     plt.plot(t_time, data_tau1[:, i], label=f'Joint {i+1}')
 plt.title('Robot 1 Torques')
@@ -703,7 +821,7 @@ plt.legend()
 plt.grid(True)
 
 # Robot 2 torques
-plt.subplot(2, 3, 5)
+plt.subplot(3, 3, 5)
 for i in range(9):  # All 9 joints (7 arm + 2 gripper)
     plt.plot(t_time, data_tau2[:, i], label=f'Joint {i+1}')
 plt.title('Robot 2 Torques')
@@ -713,7 +831,7 @@ plt.legend()
 plt.grid(True)
 
 # Contact forces
-plt.subplot(2, 3, 6)
+plt.subplot(3, 3, 6)
 plt.plot(t_time, data_contact_forces[:, 0], label='Robot 1 X')
 plt.plot(t_time, data_contact_forces[:, 1], label='Robot 1 Y')
 plt.plot(t_time, data_contact_forces[:, 2], label='Robot 1 Z')
@@ -726,7 +844,45 @@ plt.ylabel('Force (N)')
 plt.legend()
 plt.grid(True)
 
+# FCL distances for Robot 1
+plt.subplot(3, 3, 7)
+fcl_labels = ['link7', 'hand', 'leftfinger', 'rightfinger']
+for i in range(4):
+    plt.plot(t_time, data_fcl1[:, i], label=fcl_labels[i])
+plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
+plt.title('Robot 1 FCL Distances to Box')
+plt.xlabel('Time (s)')
+plt.ylabel('Signed Distance (m)')
+plt.legend()
+plt.grid(True)
+
+# FCL distances for Robot 2
+plt.subplot(3, 3, 8)
+for i in range(4):
+    plt.plot(t_time, data_fcl2[:, i], label=fcl_labels[i])
+plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
+plt.title('Robot 2 FCL Distances to Box')
+plt.xlabel('Time (s)')
+plt.ylabel('Signed Distance (m)')
+plt.legend()
+plt.grid(True)
+
+# Combined minimum FCL distances
+plt.subplot(3, 3, 9)
+min_fcl1 = np.min(data_fcl1, axis=1)  # Minimum distance per timestep for robot 1
+min_fcl2 = np.min(data_fcl2, axis=1)  # Minimum distance per timestep for robot 2
+plt.plot(t_time, min_fcl1, label='Robot 1 Min Distance', linewidth=2)
+plt.plot(t_time, min_fcl2, label='Robot 2 Min Distance', linewidth=2)
+plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
+plt.title('Minimum FCL Distances to Box')
+plt.xlabel('Time (s)')
+plt.ylabel('Min Signed Distance (m)')
+plt.legend()
+plt.grid(True)
+
 plt.tight_layout()
 plt.show()
+
+
 
 print("Dual robot simulation and analysis completed!") 

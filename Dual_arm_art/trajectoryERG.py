@@ -99,8 +99,9 @@ class ExplicitReferenceGovernor:
         self.tau_pred_list_ = np.zeros((self.plant_pred.get_actuation_input_port().size(), self.num_pred_samples_ + 1))
         
         # Arrays to store body poses (translation part) for each prediction step
-        # Store poses for all 7 links (panda_link1 to panda_link7) for each prediction step
-        self.body_pose_list_ = np.zeros((7, 3, self.num_pred_samples_ + 1))  # 7 links, 3 coordinates (X,Y,Z), prediction steps
+        # Store poses for 7 links (panda_link1..panda_link7) PLUS panda_hand for each prediction step
+        # Shape: (8 tracked bodies, 3 coordinates (X,Y,Z), prediction steps)
+        self.body_pose_list_ = np.zeros((8, 3, self.num_pred_samples_ + 1))
         
         # Limits for joint angles, velocities, and torques
         self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
@@ -157,6 +158,7 @@ class ExplicitReferenceGovernor:
         """
         # Get trajectory predictions and return the calculated energy
         total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
+        print(f"Total energy: {total_energy}")
         return total_energy
 
     def navigationField(self, q_r, q_v, box_position_constraint=None):
@@ -243,7 +245,28 @@ class ExplicitReferenceGovernor:
             J_pinv = np.linalg.pinv(Jq_V_WEp)
             jacobians.append(J_pinv)
         
-        # Calculate normalized q_dots for each link
+        # Also include panda_hand
+        try:
+            hand_body = self.plant_pred.GetBodyByName("panda_hand")
+            hand_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body)
+            link_names.append("panda_hand")
+            link_positions.append(hand_pose.translation())
+            frame = self.plant_pred.GetFrameByName("panda_hand")
+            world_frame = self.plant_pred.world_frame()
+            Jq_V_WEp = self.plant_pred.CalcJacobianTranslationalVelocity(
+                self.plant_context,
+                JacobianWrtVariable.kQDot,
+                frame,
+                np.zeros(3),
+                world_frame,
+                world_frame
+            )
+            J_pinv = np.linalg.pinv(Jq_V_WEp)
+            jacobians.append(J_pinv)
+        except Exception:
+            pass
+
+        # Calculate normalized q_dots for each link (7 + optional hand)
         normalized_q_dots = []
         for i in range(len(link_positions)-1):  # This will be 0-6 for 7 links
             qdot = jacobians[i] @ c
@@ -252,7 +275,7 @@ class ExplicitReferenceGovernor:
             normalized_q_dots.append(normalized_q_dot)
         
         # Calculate soft repulsion for each link
-        for i in range(1, len(link_positions)):  # Start from 1 as in C++ code
+        for i in range(1, len(link_positions)):  # Start from 1 as in C++ code (includes hand if present)
             link_pos = link_positions[i]
             
             # Calculate scale factor using individual joint KP gains
@@ -367,7 +390,7 @@ class ExplicitReferenceGovernor:
             # Define link range (similar to C++ code)
             init_link_id = 1  # Start from panda_link1
             final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 1  # Total number of links
+            s = final_link_id - init_link_id + 2  # 7 links + panda_hand
             
             # Initialize plant_positions matrix (3 x s)
             plant_positions = np.zeros((3, s))
@@ -377,12 +400,18 @@ class ExplicitReferenceGovernor:
                 body_name = f"panda_link{j}"
                 body = self.plant_pred.GetBodyByName(body_name)
                 plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                
-                # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
                 plant_positions[:, j - init_link_id] = plant_joint_position
+
+            # Also include panda_hand as the 8th tracked body
+            try:
+                hand_body = self.plant_pred.GetBodyByName("panda_hand")
+                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
+                plant_positions[:, 7] = hand_pos
+            except Exception:
+                plant_positions[:, 7] = 0.0
             
-            # Store all link poses in body_pose_list_
-            for link_idx in range(7):
+            # Store all link poses (7 links + hand) in body_pose_list_
+            for link_idx in range(8):
                 self.body_pose_list_[link_idx, :, 0] = plant_positions[:, link_idx]
                 
         except Exception as e:
@@ -431,9 +460,9 @@ class ExplicitReferenceGovernor:
             self.tau_pred_list_[:, k + 1] = tau_pred
             
             # Store body pose from calc_dynamics return
-            # body_pose_translation contains poses for all 7 links
+            # body_pose_translation contains poses for all 7 links + panda_hand in column 7
             # Store in body_pose_list_ for this prediction step
-            for link_idx in range(7):
+            for link_idx in range(8):
                 self.body_pose_list_[link_idx, :, k + 1] = body_pose_translation[:, link_idx]
 
         # Convert lists to arrays for plotting
@@ -526,7 +555,7 @@ class ExplicitReferenceGovernor:
             # Define link range (similar to C++ code)
             init_link_id = 1  # Start from panda_link1
             final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 1  # Total number of links
+            s = final_link_id - init_link_id + 2  # 7 links + panda_hand
             
             # Initialize plant_positions matrix (3 x s)
             plant_positions = np.zeros((3, s))
@@ -536,16 +565,23 @@ class ExplicitReferenceGovernor:
                 body_name = f"panda_link{j}"
                 body = self.plant_pred.GetBodyByName(body_name)
                 plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                
                 # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
                 plant_positions[:, j - init_link_id] = plant_joint_position
-            
-            # Return all link poses
+
+            # Also include panda_hand as column 7 (8th tracked body)
+            try:
+                hand_body = self.plant_pred.GetBodyByName("panda_hand")
+                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
+                plant_positions[:, 7] = hand_pos
+            except Exception:
+                plant_positions[:, 7] = 0.0
+
+            # Return all link poses (7 links + hand)
             body_pose_translation = plant_positions
             
         except Exception as e:
             print(f"Body pose calculation failed in calc_dynamics: {e}")
-            body_pose_translation = np.zeros((3, 7))  # Return 3x7 matrix for 7 links
+            body_pose_translation = np.zeros((3, 8))  # Return 3x8 matrix for 7 links + hand
         
         # Return both next state and body pose translation
         return x_next, body_pose_translation

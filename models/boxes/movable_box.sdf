@@ -28,14 +28,14 @@
         <surface>
           <friction>
             <ode>
-              <mu>0.8</mu>
-              <mu2>0.8</mu2>
+              <mu>0.7</mu>
+              <mu2>0.7</mu2>
             </ode>
           </friction>
           <contact>
             <ode>
-              <kp>100000000000</kp>
-              <kd>100000000</kd>
+              <kp>100</kp>
+              <kd>100</kd>
               <max_vel>0.01</max_vel>
             </ode>
           </contact>
@@ -53,7 +53,7 @@
       </collision>
 
       <!-- Positioned on top of fixed box -->
-      <pose>0.6 0 0.2 0 0 0</pose>
+      <pose>0.85 0 0.2 0 0 0</pose>
     </link>
   </model>
 </sdf>
