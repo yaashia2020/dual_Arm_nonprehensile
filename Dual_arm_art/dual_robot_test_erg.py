@@ -29,7 +29,7 @@ from pydrake.visualization import AddDefaultVisualization
 
 # Add Relaxed IK wrapper import
 import sys
-wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/relaxed_ik_core/wrappers"
+wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/submodules/relaxed_ik_core/wrappers"
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
  
