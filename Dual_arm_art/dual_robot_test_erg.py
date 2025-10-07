@@ -20,7 +20,7 @@ import time
 import matplotlib.pyplot as plt
 import csv  
 from pydrake.all import *
-import pydot
+# import pydot
 from IPython.display import SVG, display
 from trajectoryERG import ExplicitReferenceGovernor
 import os
@@ -32,7 +32,7 @@ import sys
 wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/relaxed_ik_core/wrappers"
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
-
+ 
 # Import FCL system from fcl_test.py
 from fcl_test import FCLLinkDistanceSystem
 
@@ -612,10 +612,10 @@ fcl_robot2 = builder.AddSystem(FCLLinkDistanceSystem(plant, panda2_id, movable_b
 
 
 # Add PID controllers for both robots
-Kp1 = 15 * np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120.0, 120.0])  # 9 joints
-Kd1 = 10 * np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5.0, 5.0])  # 9 joints
-Kp2 = 15 * np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120.0, 120.0])  # 9 joints
-Kd2 = 10 * np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5.0, 5.0])  # 9 joints
+Kp1 =  np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120.0, 120.0])  # 9 joints
+Kd1 =  np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5.0, 5.0])  # 9 joints
+Kp2 =  np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 120.0, 120.0])  # 9 joints
+Kd2 =  np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 5.0, 5.0])  # 9 joints
 
 controller1 = builder.AddNamedSystem("PD+G controller 1", PD_gravity(plant, Kp1, Kd1, panda1_id))
 controller2 = builder.AddNamedSystem("PD+G controller 2", PD_gravity(plant, Kp2, Kd2, panda2_id))
@@ -653,6 +653,12 @@ fcl_logger1 = LogVectorOutput(fcl_robot1.get_output_port(0), builder)
 fcl_logger1.set_name("fcl_logger1")
 fcl_logger2 = LogVectorOutput(fcl_robot2.get_output_port(0), builder)
 fcl_logger2.set_name("fcl_logger2")
+
+# Add energy loggers for both ERG systems
+energy_logger1 = LogVectorOutput(erg1.GetOutputPort("calculated_energy"), builder)
+energy_logger1.set_name("energy_logger1")
+energy_logger2 = LogVectorOutput(erg2.GetOutputPort("calculated_energy"), builder)
+energy_logger2.set_name("energy_logger2")
 
 
 
@@ -715,7 +721,7 @@ simulator.Initialize()
 
 # Run simulation
 print("Starting dual robot simulation...")
-simulator.AdvanceTo(10.0) 
+simulator.AdvanceTo(2.0) 
 
 print("Simulation completed!")
 
@@ -732,6 +738,8 @@ log_contact = contact_logger.FindLog(diagram_context)
 log_pose = pose_logger.FindLog(diagram_context)
 log_fcl1 = fcl_logger1.FindLog(diagram_context)
 log_fcl2 = fcl_logger2.FindLog(diagram_context)
+log_energy1 = energy_logger1.FindLog(diagram_context)
+log_energy2 = energy_logger2.FindLog(diagram_context)
 
 
 # Extract time data
@@ -764,6 +772,10 @@ data_pose = log_pose.data().transpose()
 data_fcl1 = log_fcl1.data().transpose()  # Robot 1 FCL distances (4 links)
 data_fcl2 = log_fcl2.data().transpose()  # Robot 2 FCL distances (4 links)
 
+# Extract energy data for both robots
+data_energy1 = log_energy1.data().transpose()  # Robot 1 energy
+data_energy2 = log_energy2.data().transpose()  # Robot 2 energy
+
 
 
 print("\n=== Dual Robot Simulation Results ===")
@@ -773,6 +785,50 @@ print(f"Box final position: {data_box_pos[-1, 4:7]}")  # x, y, z position
 print(f"Final contact forces - Robot 1: {data_contact_forces[-1, :3]}, Robot 2: {data_contact_forces[-1, 3:6]}")
 print(f"Final FCL distances - Robot 1: {data_fcl1[-1, :]} (link7, hand, leftfinger, rightfinger)")
 print(f"Final FCL distances - Robot 2: {data_fcl2[-1, :]} (link7, hand, leftfinger, rightfinger)")
+
+# Check for torque limit violations
+print("\n=== Torque Limit Violation Analysis ===")
+# Panda robot torque limits (Nm) for 7 arm joints
+torque_limits = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
+
+# Check Robot 1 torque violations
+max_torques_1 = np.max(np.abs(data_tau1[:, :7]), axis=0)  # Max absolute torque for each joint
+violations_found_1 = False
+for i in range(7):
+    if max_torques_1[i] > torque_limits[i]:
+        if not violations_found_1:
+            print("Robot 1 Torque Violations:")
+            violations_found_1 = True
+        violation_percent = (max_torques_1[i] / torque_limits[i]) * 100
+        print(f"  JOINT {i+1} VIOLATION: {max_torques_1[i]:.2f} Nm (limit: {torque_limits[i]:.1f} Nm, {violation_percent:.1f}% over limit)")
+
+# Check Robot 2 torque violations
+max_torques_2 = np.max(np.abs(data_tau2[:, :7]), axis=0)  # Max absolute torque for each joint
+violations_found_2 = False
+for i in range(7):
+    if max_torques_2[i] > torque_limits[i]:
+        if not violations_found_2:
+            print("\nRobot 2 Torque Violations:")
+            violations_found_2 = True
+        violation_percent = (max_torques_2[i] / torque_limits[i]) * 100
+        print(f"  JOINT {i+1} VIOLATION: {max_torques_2[i]:.2f} Nm (limit: {torque_limits[i]:.1f} Nm, {violation_percent:.1f}% over limit)")
+
+# Check for any violations during simulation
+violations_1 = np.any(np.abs(data_tau1[:, :7]) > torque_limits, axis=1)
+violations_2 = np.any(np.abs(data_tau2[:, :7]) > torque_limits, axis=1)
+
+if np.any(violations_1):
+    violation_times_1 = t_time[violations_1]
+    print(f"\nRobot 1 had torque violations at {len(violation_times_1)} time steps")
+    print(f"First violation at t={violation_times_1[0]:.3f}s, Last violation at t={violation_times_1[-1]:.3f}s")
+
+if np.any(violations_2):
+    violation_times_2 = t_time[violations_2]
+    print(f"\nRobot 2 had torque violations at {len(violation_times_2)} time steps")
+    print(f"First violation at t={violation_times_2[0]:.3f}s, Last violation at t={violation_times_2[-1]:.3f}s")
+
+if not violations_found_1 and not violations_found_2:
+    print("No torque limit violations detected for either robot.")
 
 
 # Create plots for both robots
@@ -877,6 +933,49 @@ plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
 plt.title('Minimum FCL Distances to Box')
 plt.xlabel('Time (s)')
 plt.ylabel('Min Signed Distance (m)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# Create separate energy plots
+plt.figure(figsize=(12, 8))
+
+# Individual energy plots
+plt.subplot(2, 2, 1)
+plt.plot(t_time, data_energy1.flatten(), label='Robot 1 Energy', linewidth=2)
+plt.title('Robot 1 ERG Energy')
+plt.xlabel('Time (s)')
+plt.ylabel('Energy')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(2, 2, 2)
+plt.plot(t_time, data_energy2.flatten(), label='Robot 2 Energy', linewidth=2)
+plt.title('Robot 2 ERG Energy')
+plt.xlabel('Time (s)')
+plt.ylabel('Energy')
+plt.legend()
+plt.grid(True)
+
+# Combined energy plot
+plt.subplot(2, 2, 3)
+total_energy = data_energy1.flatten() + data_energy2.flatten()
+plt.plot(t_time, total_energy, label='Total Energy', linewidth=2, color='red')
+plt.title('Total System Energy')
+plt.xlabel('Time (s)')
+plt.ylabel('Total Energy')
+plt.legend()
+plt.grid(True)
+
+# Energy difference plot
+plt.subplot(2, 2, 4)
+energy_diff = data_energy1.flatten() - data_energy2.flatten()
+plt.plot(t_time, energy_diff, label='Energy Difference (R1-R2)', linewidth=2, color='green')
+plt.title('Energy Difference Between Robots')
+plt.xlabel('Time (s)')
+plt.ylabel('Energy Difference')
 plt.legend()
 plt.grid(True)
 

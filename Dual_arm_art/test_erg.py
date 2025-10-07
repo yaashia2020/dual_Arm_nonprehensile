@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import csv  
 from pydrake.all import *
-import pydot
+# import pydot
 from IPython.display import SVG, display
 from trajectoryERG import ExplicitReferenceGovernor
 import os
