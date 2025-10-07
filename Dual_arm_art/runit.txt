@@ -1,0 +1,11 @@
+cd ~/dual_arm_nonprehensile-CERG-pushing-arm/relaxedik_env
+source bin/activate
+
+
+
+
+(relaxedik_env) art@art:~/dual_arm_nonprehensile-CERG-pushing-arm/Dual_arm_art$  
+
+
+deactivate
+

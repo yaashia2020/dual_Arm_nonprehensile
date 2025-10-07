@@ -4,7 +4,7 @@
     <static>false</static>
     <link name="box_link">
       <inertial>
-        <mass>1.0</mass>
+        <mass>0.5</mass>
       </inertial>
 
       <visual name="visual">
@@ -28,16 +28,11 @@
         <surface>
           <friction>
             <ode>
-              <mu>0.7</mu>
-              <mu2>0.7</mu2>
+              <mu>0.9</mu>
+              <mu2>0.8</mu2>
             </ode>
           </friction>
           <contact>
-            <ode>
-              <kp>100</kp>
-              <kd>100</kd>
-              <max_vel>0.01</max_vel>
-            </ode>
           </contact>
           <bounce>
             <restitution_coefficient>0.0</restitution_coefficient>
@@ -45,15 +40,16 @@
           </bounce>
         </surface>
 
-        <!-- Enable soft hydroelastic contact (can be modified)-->
+        <!-- Enable rigid hydroelastic contact -->
         <drake:proximity_properties>
-          <drake:compliant_hydroelastic />
-          <drake:hydroelastic_modulus>1e8</drake:hydroelastic_modulus>
+          <drake:rigid_hydroelastic/>
+          <drake:mu_static>0.9</drake:mu_static>
+          <drake:mu_dynamic>0.8</drake:mu_dynamic>
         </drake:proximity_properties>
       </collision>
 
       <!-- Positioned on top of fixed box -->
-      <pose>0.85 0 0.2 0 0 0</pose>
+      <pose>0.0 -0.3 0.41 0 0 0</pose>
     </link>
   </model>
 </sdf>
