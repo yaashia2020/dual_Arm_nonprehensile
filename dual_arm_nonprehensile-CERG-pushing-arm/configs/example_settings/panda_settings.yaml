@@ -1,0 +1,9 @@
+# Custom Relaxed IK config for Panda FR3
+urdf: panda.urdf
+link_radius: 0.05 
+base_links:
+  - world
+ee_links:
+  - rubber_pad
+starting_config: [1.57, -0.785, 0.0, -2.356, 1.57, 1.571, -0.785]  # Custom initial pose
+obstacles:
