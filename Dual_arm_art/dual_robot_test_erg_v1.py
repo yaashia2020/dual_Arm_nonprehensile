@@ -20,7 +20,7 @@ import time
 import matplotlib.pyplot as plt
 import csv  
 from pydrake.all import *
-import pydot
+# import pydot
 from IPython.display import SVG, display
 from trajectoryERG import ExplicitReferenceGovernor
 import os
@@ -29,7 +29,7 @@ from pydrake.visualization import AddDefaultVisualization
 
 # Add Relaxed IK wrapper import
 import sys
-wrapper_dir = "/home/art/dual_arm_nonprehensile-CERG-pushing-arm/relaxed_ik_core/wrappers"
+wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/submodules/relaxed_ik_core/wrappers"
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
 

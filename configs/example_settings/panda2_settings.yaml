@@ -1,5 +1,5 @@
 # Custom Relaxed IK config for Panda FR3
-urdf: panda2.urdf
+urdf: panda_drake2.urdf
 link_radius: 0.05 
 base_links:
   - world

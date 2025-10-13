@@ -32,7 +32,7 @@ from scipy.spatial.transform import Rotation as R
 
 # Add Relaxed IK wrapper import
 import sys
-wrapper_dir = "/home/art/dual_arm_nonprehensile-CERG-pushing-arm/relaxed_ik_core/wrappers"
+wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/submodules/relaxed_ik_core/wrappers"
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
 
@@ -156,8 +156,8 @@ def create_dual_robot_system_model(plant, scene_graph):
         Tuple containing the updated plant, scene_graph, and plant_context.
     """
     # Load Panda robot models (using different URDFs for dual robots)
-    panda_path_1 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
-    panda_path_2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake2.urdf"))
+    panda_path_1 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3_c.urdf"))
+    panda_path_2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3_2.urdf"))
 
     
     # Add both Panda robots

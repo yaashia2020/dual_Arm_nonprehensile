@@ -6,12 +6,12 @@
 <!-- |    combination is equal to the reflected rotor interia provided by Franka for   | -->
 <!-- |    the FR-3 robots.                                                             | -->
 <!-- =================================================================================== -->
-<robot name="panda_1">
+<robot name="panda">
   <link name="world"/>
   <joint name="robot_to_world" type="fixed">
     <parent link="world"/>
     <child link="panda_link0"/>
-    <origin rpy="0.0 0.0 3.14159" xyz="0.5 0.0 0.0"/>
+    <origin rpy="0.0 0.0 3.14" xyz="-0.5 0.0 0.0"/>
   </joint>
   <link name="panda_link0">
     <inertial>
@@ -30,11 +30,6 @@
       <geometry>
         <mesh filename="../meshes/link0_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <link name="panda_link1">
@@ -54,11 +49,6 @@
       <geometry>
         <mesh filename="../meshes/link1_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
 
@@ -89,11 +79,6 @@
       <geometry>
         <mesh filename="../meshes/link2_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint2" type="revolute">
@@ -121,11 +106,6 @@
       <geometry>
         <mesh filename="../meshes/link3_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint3" type="revolute">
@@ -152,11 +132,6 @@
       <geometry>
         <mesh filename="../meshes/link4_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint4" type="revolute">
@@ -183,11 +158,6 @@
       <geometry>
         <mesh filename="../meshes/link5_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint5" type="revolute">
@@ -214,11 +184,6 @@
       <geometry>
         <mesh filename="../meshes/link6_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint6" type="revolute">
@@ -245,11 +210,6 @@
       <geometry>
         <mesh filename="../meshes/link7_simple.obj"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-      </drake:proximity_properties>
     </collision>
   </link>
   <joint name="panda_joint7" type="revolute">
@@ -277,8 +237,6 @@
     <actuator name="panda_motor1">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000605721456" />
     </actuator>
   </transmission>
 
@@ -290,8 +248,6 @@
     <actuator name="panda_motor2">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000605721456" />
     </actuator>
   </transmission>
   <transmission name="panda_tran3">
@@ -302,8 +258,6 @@
     <actuator name="panda_motor3">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000462474144" />
     </actuator>
   </transmission>
   <transmission name="panda_tran4">
@@ -314,8 +268,6 @@
     <actuator name="panda_motor4">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000462474144" />
     </actuator>
   </transmission>
   <transmission name="panda_tran5">
@@ -326,8 +278,6 @@
     <actuator name="panda_motor5">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000205544064" />
     </actuator>
   </transmission>
   <transmission name="panda_tran6">
@@ -338,8 +288,6 @@
     <actuator name="panda_motor6">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000205544064" />
     </actuator>
   </transmission>
   <transmission name="panda_tran7">
@@ -350,24 +298,10 @@
     <actuator name="panda_motor7">
       <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
       <mechanicalReduction>1</mechanicalReduction>
-      <drake:gear_ratio value="100.0" />
-      <drake:rotor_inertia value="0.0000205544064" />
+
     </actuator>
   </transmission>
   
-  
-  <!-- <drake:collision_filter_group name="group_link57">
-    <drake:member link="panda_link5"/>
-    <drake:member link="panda_link7"/>
-    <drake:ignored_collision_filter_group name="group_link57"/>
-  </drake:collision_filter_group> -->
-  <!-- <drake:collision_filter_group name="group_link68">
-    <drake:member link="panda_link6"/>
-    <drake:member link="panda_link8"/>
-    <drake:ignored_collision_filter_group name="group_link68"/>
-  </drake:collision_filter_group> -->
-
-  <!-- === Pads setup (replaces fingers) === -->
 
   <link name="panda_hand">
     <inertial>
@@ -387,13 +321,6 @@
       <geometry>
         <mesh filename="../meshes/franka_pad2.obj" scale="0.001 0.001 0.001"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-        <drake:mu_dynamic value="0.8"/>
-        <drake:mu_static value="0.8"/>
-      </drake:proximity_properties>
     </collision>
   </link>
 
@@ -422,13 +349,6 @@
       <geometry>
         <mesh filename="../meshes/rubber_pad.obj" scale="0.001 0.001 0.001"/>
       </geometry>
-      <drake:proximity_properties>
-        <drake:rigid_hydroelastic/>
-        <drake:mesh_resolution_hint value="1.5"/>
-        <drake:hunt_crossley_dissipation value="1.25"/>
-        <drake:mu_dynamic value="0.8"/>
-        <drake:mu_static value="0.8"/>
-      </drake:proximity_properties>
     </collision>
   </link>
 
@@ -454,17 +374,3 @@
 
 </robot>
 
-  <drake:collision_filter_group name="all">
-    <drake:member link="panda_link0"/>
-    <drake:member link="panda_link1"/>
-    <drake:member link="panda_link2"/>
-    <drake:member link="panda_link3"/>
-    <drake:member link="panda_link4"/>
-    <drake:member link="panda_link5"/>
-    <drake:member link="panda_link6"/>
-    <drake:member link="panda_link7"/>
-    <drake:member link="panda_hand"/>
-    <drake:member link="panda_rightfinger"/>
-    <drake:member link="panda_leftfinger"/>
-    <drake:ignored_collision_filter_group name="all"/>
-  </drake:collision_filter_group>
