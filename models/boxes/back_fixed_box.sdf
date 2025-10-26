@@ -1,0 +1,42 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="back_fixed_box">
+    <static>true</static>
+    <link name="box_link">
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.3 0.4 1.0</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.8 0.2 0.2 1.0</diffuse>   <!-- Red -->
+          <specular>0.4 0.1 0.1 1.0</specular>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.3 0.4 1.0</size>
+          </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.8</mu>
+              <mu2>0.8</mu2>
+            </ode>
+          </friction>
+        </surface>
+        <!-- Drake uses these; Gazebo <surface> will be ignored -->
+        <drake:proximity_properties>
+            <drake:rigid_hydroelastic/>
+            <drake:mu_static>0.6</drake:mu_static>
+            <drake:mu_dynamic>0.55</drake:mu_dynamic>
+        </drake:proximity_properties>
+      </collision>
+      <!-- Positioned behind the middle fixed box in X-axis direction -->
+      <pose>1.0 0.0 0.5 0 0 0</pose>
+    </link>
+  </model>
+</sdf>

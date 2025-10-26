@@ -64,7 +64,8 @@ def min_signed_distance_between_sets(
     """Brute-force min signed distance across link pairs (negative => penetration)."""
     req = fcl.DistanceRequest(enable_signed_distance=True, enable_nearest_points=True)
     best = {"d": np.inf, "a_link": None, "b_link": None,
-            "nearest_on_a": None, "nearest_on_b": None, "normal_A_to_B": None}
+            "nearest_on_a": None, "nearest_on_b": None, "normal_A_to_B": None, 
+            "x_distance": None, "distance_vector": None, "true_distance": None}
     for (_ia, name_a, _Ta, a_obj) in objs_a:
         for (_ib, name_b, _Tb, b_obj) in objs_b:
             res = fcl.DistanceResult()
@@ -78,14 +79,24 @@ def min_signed_distance_between_sets(
                 except Exception:
                     pass
                 normal = None
+                x_distance = None
+                distance_vector = None
+                true_distance = None
                 if pA is not None and pB is not None:
                     v = pB - pA
                     n = np.linalg.norm(v)
                     if n > 1e-12:
                         normal = v / n
+                    # Calculate X-axis distance: box_x - robot_x
+                    x_distance = pB[0] - pA[0]
+                    # Store the full distance vector [x, y, z]
+                    distance_vector = v
+                    # Calculate true geometric distance
+                    true_distance = n
                 best.update(d=d, a_link=name_a, b_link=name_b,
                             nearest_on_a=pA, nearest_on_b=pB,
-                            normal_A_to_B=normal)
+                            normal_A_to_B=normal, x_distance=x_distance,
+                            distance_vector=distance_vector, true_distance=true_distance)
     return best
 
 
@@ -166,6 +177,164 @@ class FCLLinkDistanceSystem(LeafSystem):
         # print(f"FCL distances: link7={dvals[0]:.4f}, hand={dvals[1]:.4f}, leftfinger={dvals[2]:.4f}, rightfinger={dvals[3]:.4f}")
         
         output.SetFromVector(dvals[:4])
+
+
+class FCLXAxisDistanceSystem(LeafSystem):
+    """
+    Outputs X-axis distances (m) from selected robot links to the movable box using FCL nearest points.
+    Uses the same efficient approach as FCLLinkDistanceSystem - pre-builds FCL objects and updates transforms.
+    Links: panda_link7, panda_hand, panda_leftfinger, panda_rightfinger
+    Output: [x_dist_link7, x_dist_hand, x_dist_leftfinger, x_dist_rightfinger]
+    """
+    def __init__(self, plant, robot_instance: ModelInstanceIndex, box_instance: ModelInstanceIndex):
+        super().__init__()
+        self._plant = plant
+        self._robot_instance = robot_instance
+        self._box_instance = box_instance
+
+        # Input: full plant state (q; v)
+        state_size = plant.num_positions() + plant.num_velocities()
+        self._x_port = self.DeclareVectorInputPort("x", BasicVector(state_size))
+
+        # Output: 4 X-axis distances
+        self.DeclareVectorOutputPort("x_distances", BasicVector(4), self._calc_output)
+
+        # Temp context for pose queries
+        self._tmp_ctx = plant.CreateDefaultContext()
+
+        # Resolve bodies and build FCL objects for the four links (same as FCLLinkDistanceSystem)
+        self._link_names = [
+            "panda_link7",
+            "panda_hand",
+            "panda_leftfinger",
+            "panda_rightfinger",
+        ]
+        self._robot_links: List[Tuple[BodyIndex, str, np.ndarray, fcl.CollisionObject]] = []
+        for nm in self._link_names:
+            try:
+                body = plant.GetBodyByName(nm, robot_instance)
+                geom = fcl.Box(0.10, 0.10, 0.10)  # 10 cm cube placeholder per link
+                self._robot_links.append((body.index(), nm, np.eye(4), fcl.CollisionObject(geom)))
+            except Exception:
+                # If a body is missing, append a dummy placeholder tied to world
+                self._robot_links.append((plant.world_body().index(), nm, np.eye(4), fcl.CollisionObject(fcl.Box(0.10, 0.10, 0.10))))
+
+        # Build FCL objects for the box (single body: box_link)
+        self._box_links: List[Tuple[BodyIndex, str, np.ndarray, fcl.CollisionObject]] = []
+        try:
+            box_body = plant.GetBodyByName("box_link", box_instance)
+            self._box_links.append((box_body.index(), "box_link", np.eye(4), fcl.CollisionObject(fcl.Box(0.22, 0.30, 0.20))))
+        except Exception:
+            # Fallback dummy
+            self._box_links.append((plant.world_body().index(), "box_link", np.eye(4), fcl.CollisionObject(fcl.Box(0.22, 0.30, 0.20))))
+
+    def _calc_output(self, context, output):
+        # Pull full plant state and sync temp context
+        x = self._x_port.Eval(context)
+        try:
+            self._plant.SetPositionsAndVelocities(self._tmp_ctx, x)
+        except Exception:
+            # Fallback: split q and v
+            nq = self._plant.num_positions()
+            self._plant.SetPositions(self._tmp_ctx, x[:nq])
+            self._plant.SetVelocities(self._tmp_ctx, x[nq:])
+
+        # Update FCL object transforms for robot links (same as FCLLinkDistanceSystem)
+        update_fcl_objects_from_context_by_index(self._plant, self._tmp_ctx, self._robot_links)
+        # Update for box
+        update_fcl_objects_from_context_by_index(self._plant, self._tmp_ctx, self._box_links)
+
+        # Compute X-axis distances per link (robot link vs any box geometry)
+        x_distances = []
+        for (bidx, nm, T_LC, obj) in self._robot_links:
+            res = min_signed_distance_between_sets([(bidx, nm, T_LC, obj)], self._box_links)
+            x_dist = res["x_distance"]
+            if x_dist is not None:
+                x_distances.append(float(x_dist))
+            else:
+                x_distances.append(0.0)  # Fallback if no nearest points
+
+        output.SetFromVector(x_distances[:4])
+
+
+class FCLDistanceVectorSystem(LeafSystem):
+    """
+    Outputs distance vectors and verification data for FCL distance calculations.
+    Outputs: [distance_vector_x, distance_vector_y, distance_vector_z, true_distance, fcl_distance]
+    """
+    def __init__(self, plant, robot_instance: ModelInstanceIndex, box_instance: ModelInstanceIndex):
+        super().__init__()
+        self._plant = plant
+        self._robot_instance = robot_instance
+        self._box_instance = box_instance
+
+        # Input: full plant state (q; v)
+        state_size = plant.num_positions() + plant.num_velocities()
+        self._x_port = self.DeclareVectorInputPort("x", BasicVector(state_size))
+
+        # Output: 5 values [dx, dy, dz, true_dist, fcl_dist]
+        self.DeclareVectorOutputPort("distance_data", BasicVector(5), self._calc_output)
+
+        # Temp context for pose queries
+        self._tmp_ctx = plant.CreateDefaultContext()
+
+        # Resolve bodies and build FCL objects for the four links
+        self._link_names = [
+            "panda_link7",
+            "panda_hand", 
+            "panda_leftfinger",
+            "panda_rightfinger",
+        ]
+        self._robot_links: List[Tuple[BodyIndex, str, np.ndarray, fcl.CollisionObject]] = []
+        for nm in self._link_names:
+            try:
+                body = plant.GetBodyByName(nm, robot_instance)
+                geom = fcl.Box(0.10, 0.10, 0.10)  # 10 cm cube placeholder per link
+                self._robot_links.append((body.index(), nm, np.eye(4), fcl.CollisionObject(geom)))
+            except Exception:
+                # If a body is missing, append a dummy placeholder tied to world
+                self._robot_links.append((plant.world_body().index(), nm, np.eye(4), fcl.CollisionObject(fcl.Box(0.10, 0.10, 0.10))))
+
+        # Build FCL objects for the box (single body: box_link)
+        self._box_links: List[Tuple[BodyIndex, str, np.ndarray, fcl.CollisionObject]] = []
+        try:
+            box_body = plant.GetBodyByName("box_link", box_instance)
+            self._box_links.append((box_body.index(), "box_link", np.eye(4), fcl.CollisionObject(fcl.Box(0.22, 0.30, 0.20))))
+        except Exception:
+            # Fallback dummy
+            self._box_links.append((plant.world_body().index(), "box_link", np.eye(4), fcl.CollisionObject(fcl.Box(0.22, 0.30, 0.20))))
+
+    def _calc_output(self, context, output):
+        # Pull full plant state and sync temp context
+        x = self._x_port.Eval(context)
+        try:
+            self._plant.SetPositionsAndVelocities(self._tmp_ctx, x)
+        except Exception:
+            # Fallback: split q and v
+            nq = self._plant.num_positions()
+            self._plant.SetPositions(self._tmp_ctx, x[:nq])
+            self._plant.SetVelocities(self._tmp_ctx, x[nq:])
+
+        # Update FCL object transforms for robot links
+        update_fcl_objects_from_context_by_index(self._plant, self._tmp_ctx, self._robot_links)
+        # Update for box
+        update_fcl_objects_from_context_by_index(self._plant, self._tmp_ctx, self._box_links)
+
+        # Find the minimum distance pair and get distance vector
+        min_result = min_signed_distance_between_sets(self._robot_links, self._box_links)
+        
+        # Extract distance vector and verification data
+        if min_result["distance_vector"] is not None:
+            distance_vector = min_result["distance_vector"]
+            dx, dy, dz = distance_vector[0], distance_vector[1], distance_vector[2]
+            true_distance = min_result["true_distance"]
+            fcl_distance = min_result["d"]
+        else:
+            dx, dy, dz = 0.0, 0.0, 0.0
+            true_distance = 0.0
+            fcl_distance = min_result["d"]
+
+        output.SetFromVector([dx, dy, dz, true_distance, fcl_distance])
 
 
 def get_model_instance_by_name_or_first(plant, preferred_names: List[str]) -> ModelInstanceIndex:
@@ -316,6 +485,20 @@ if __name__ == "__main__":
     # Log the 4 distances over time
     fcl_logger = LogVectorOutput(fcl_sys.get_output_port(0), builder)
     fcl_logger.set_name("fcl_distances")
+    
+    # Add FCL X-axis distance system
+    fcl_x_sys = builder.AddSystem(FCLXAxisDistanceSystem(plant, mi_robot, mi_movable))
+    builder.Connect(plant.get_state_output_port(), fcl_x_sys.GetInputPort("x"))
+    # Log the X-axis distances over time
+    fcl_x_logger = LogVectorOutput(fcl_x_sys.GetOutputPort("x_distances"), builder)
+    fcl_x_logger.set_name("fcl_x_distances")
+    
+    # Add FCL distance vector verification system
+    fcl_vec_sys = builder.AddSystem(FCLDistanceVectorSystem(plant, mi_robot, mi_movable))
+    builder.Connect(plant.get_state_output_port(), fcl_vec_sys.GetInputPort("x"))
+    # Log the distance vector data over time
+    fcl_vec_logger = LogVectorOutput(fcl_vec_sys.GetOutputPort("distance_data"), builder)
+    fcl_vec_logger.set_name("fcl_distance_vectors")
 
     diagram = builder.Build()
     sim = Simulator(diagram)
@@ -379,17 +562,66 @@ if __name__ == "__main__":
     t_fcl = log_fcl.sample_times()
     data_fcl = log_fcl.data().transpose()  # shape: N x 4
 
-    # Plot
-    plt.figure(figsize=(10, 6))
-    labels = ["link7", "hand", "leftfinger", "rightfinger"]
+    # Retrieve logged FCL X-axis distances
+    log_fcl_x = fcl_x_logger.FindLog(diagram_ctx)
+    t_fcl_x = log_fcl_x.sample_times()
+    data_fcl_x = log_fcl_x.data().transpose()  # shape: N x 4
+    
+    # Retrieve logged FCL distance vector data
+    log_fcl_vec = fcl_vec_logger.FindLog(diagram_ctx)
+    t_fcl_vec = log_fcl_vec.sample_times()
+    data_fcl_vec = log_fcl_vec.data().transpose()  # shape: N x 5
+    
+    print("\n=== FCL X-axis distances (final values) ===")
+    link_names = ["link7", "hand", "leftfinger", "rightfinger"]
+    for i, name in enumerate(link_names):
+        print(f"FCL X-axis distance {name}: {data_fcl_x[-1, i]:.4f} m")
+    
+    print("\n=== FCL Distance Vector Verification (final values) ===")
+    final_vec_data = data_fcl_vec[-1]  # Last time step
+    dx, dy, dz, true_dist, fcl_dist = final_vec_data
+    print(f"Distance vector [dx, dy, dz]: [{dx:.4f}, {dy:.4f}, {dz:.4f}] m")
+    print(f"True geometric distance: {true_dist:.4f} m")
+    print(f"FCL reported distance: {fcl_dist:.4f} m")
+    print(f"Distance match: {abs(true_dist - fcl_dist):.6f} m difference")
+    
+    # Verify: true_distance should equal sqrt(dx^2 + dy^2 + dz^2)
+    calculated_distance = np.sqrt(dx**2 + dy**2 + dz**2)
+    print(f"Calculated distance (sqrt(dx²+dy²+dz²)): {calculated_distance:.4f} m")
+    print(f"Vector magnitude match: {abs(calculated_distance - true_dist):.6f} m difference")
+
+    # Plot FCL distances, X-axis distances, and distance verification
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15))
+    
+    # Plot 1: FCL signed distances
     for i in range(4):
-        plt.plot(t_fcl, data_fcl[:, i], label=labels[i])
-    plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
-    plt.title('FCL signed distances: robot links → movable box')
-    plt.xlabel('Time [s]')
-    plt.ylabel('Signed distance [m] (negative ⇒ penetration)')
-    plt.grid(True)
-    plt.legend()
+        ax1.plot(t_fcl, data_fcl[:, i], label=link_names[i])
+    ax1.axhline(0.0, color='r', linestyle='--', alpha=0.6)
+    ax1.set_title('FCL signed distances: robot links → movable box')
+    ax1.set_xlabel('Time [s]')
+    ax1.set_ylabel('Signed distance [m] (negative ⇒ penetration)')
+    ax1.grid(True)
+    ax1.legend()
+    
+    # Plot 2: FCL X-axis distances
+    for i in range(4):
+        ax2.plot(t_fcl_x, data_fcl_x[:, i], label=link_names[i])
+    ax2.axhline(0.0, color='r', linestyle='--', alpha=0.6)
+    ax2.set_title('FCL X-axis distances: movable box - robot links (from nearest points)')
+    ax2.set_xlabel('Time [s]')
+    ax2.set_ylabel('X-axis distance [m] (positive = box ahead of robot)')
+    ax2.grid(True)
+    ax2.legend()
+    
+    # Plot 3: Distance verification
+    ax3.plot(t_fcl_vec, data_fcl_vec[:, 3], label='True geometric distance', linewidth=2)
+    ax3.plot(t_fcl_vec, data_fcl_vec[:, 4], label='FCL reported distance', linewidth=2, linestyle='--')
+    ax3.set_title('Distance Verification: True vs FCL Distance')
+    ax3.set_xlabel('Time [s]')
+    ax3.set_ylabel('Distance [m]')
+    ax3.grid(True)
+    ax3.legend()
+    
     plt.tight_layout()
     plt.show()
 

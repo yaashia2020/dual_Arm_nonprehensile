@@ -1,0 +1,36 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="top_fixed_box">
+    <static>true</static>
+    <link name="box_link">
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.25 0.35 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.8 0.2 0.2 1.0</diffuse>   <!-- Red -->
+          <specular>0.4 0.1 0.1 1.0</specular>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.25 0.35 0.1</size>
+          </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.8</mu>
+              <mu2>0.8</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+      <!-- Positioned above the movable box -->
+      <pose>0.6 0.0 0.45 0 0 0</pose>
+    </link>
+  </model>
+</sdf>

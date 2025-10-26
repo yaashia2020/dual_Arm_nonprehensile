@@ -4,13 +4,13 @@
     <static>false</static>
     <link name="box_link">
       <inertial>
-        <mass>1.0</mass>
+        <mass>2</mass>
       </inertial>
 
       <visual name="visual">
         <geometry>
           <box>
-            <size>0.22 0.3 0.2</size>
+            <size>0.22 0.3 0.35</size>
           </box>
         </geometry>
         <material>
@@ -22,7 +22,7 @@
       <collision name="collision">
         <geometry>
           <box>
-            <size>0.22 0.3 0.2</size>
+            <size>0.22 0.3 0.35</size>
           </box>
         </geometry>
         <surface>
@@ -48,12 +48,17 @@
         <!-- Enable soft hydroelastic contact (can be modified)-->
         <drake:proximity_properties>
           <drake:compliant_hydroelastic />
-          <drake:hydroelastic_modulus>1e8</drake:hydroelastic_modulus>
+          <!-- <drake:hydroelastic_modulus>1e8</drake:hydroelastic_modulus> -->
+          <drake:hydroelastic_modulus>1e7</drake:hydroelastic_modulus>
+          <drake:hunt_crossley_dissipation>1.0</drake:hunt_crossley_dissipation>
+          <drake:mu_static>0.6</drake:mu_static>
+          <drake:mu_dynamic>0.55</drake:mu_dynamic>
+          <!-- <drake:resolution_hint>0.03</drake:resolution_hint> -->
         </drake:proximity_properties>
       </collision>
 
       <!-- Positioned on top of fixed box -->
-      <pose>0.85 0 0.2 0 0 0</pose>
+      <pose>0.7 0 0.875 0 0 0.02</pose>
     </link>
   </model>
 </sdf>

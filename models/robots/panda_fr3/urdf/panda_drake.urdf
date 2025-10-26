@@ -6,12 +6,12 @@
 <!-- |    combination is equal to the reflected rotor interia provided by Franka for   | -->
 <!-- |    the FR-3 robots.                                                             | -->
 <!-- =================================================================================== -->
-<robot name="panda">
+<robot name="panda" xmlns:drake="http://drake.mit.edu">
   <link name="world"/>
   <joint name="robot_to_world" type="fixed">
     <parent link="world"/>
     <child link="panda_link0"/>
-    <origin rpy="0.0 0.0 3.14" xyz="-0.5 0.0 0.0"/>
+    <origin rpy="0.0 0.0 0" xyz="0.0 0.0 0.0"/>
   </joint>
   <link name="panda_link0">
     <inertial>

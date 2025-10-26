@@ -6,13 +6,14 @@ import csv
 from pydrake.all import *
 # import pydot
 from IPython.display import SVG, display
+
+# Import ExplicitReferenceGovernor from trajectoryERG
 from trajectoryERG import ExplicitReferenceGovernor
-import os
-from pydrake.visualization import AddDefaultVisualization
+
 
 # Add Relaxed IK wrapper import
 import sys
-wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/relaxed_ik_core/wrappers"
+wrapper_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "submodules/relaxed_ik_core/wrappers")
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
 
@@ -90,6 +91,9 @@ plant, scene_graph, plant_context = create_system_model(plant, scene_graph)
 panda_id = plant.GetModelInstanceByName("panda")
 num_positions = plant.num_positions(panda_id)
 num_velocities = plant.num_velocities(panda_id)
+
+# Get the movable box model instance for specific connections
+movable_box_id = plant.GetModelInstanceByName("movable_box")
 
 ######################################################################################################
 #              ##################Relaxed IK System for Box Tracking################
@@ -177,65 +181,10 @@ class RelaxedIKBoxTracker(LeafSystem):
 ######################################################################################################
 #              ##################Planner Trapezoidal motion profile ################
 ######################################################################################################
-trajDuration_ = 3.5
-accDuration_ = 2.5
+# DELETED - Not using motion profile, using RelaxedIK instead
 
-trajInit_ = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0]) # np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
-trajEnd_ = np.array([3.0, -0.785, -0.50, -1.6, 0.7, 1.571, 0.785, 0.0, 0.0]) # np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
-class TrajectoryPoint:
-    def __init__(self):
-        self.pos = np.zeros(9)
-        self.vel = np.zeros(9)
-        self.acc = np.zeros(9)
-
-class motion_profile(LeafSystem):
-    def __init__(self):
-        super().__init__()  # Don't forget to initialize the base class.
-        self._trajInit_port = self.DeclareVectorInputPort(name="trajInit_", size=9)
-        self._trajEnd__port = self.DeclareVectorInputPort(name="trajEnd_", size=9)
-        # self.DeclareVectorOutputPort(name="q_r", size=9, calc=self.compute_trajectory) 
-
-        state_index = self.DeclareDiscreteState(9)  # One state variable.
-        self.DeclareStateOutputPort("q_r", state_index)  # One output: y=x.
-        self.DeclarePeriodicDiscreteUpdateEvent(
-            period_sec=0.01,  # time step.
-            offset_sec=0.0,  # The first event is at time zero.
-            update=self.compute_trajectory) # Call the Update method defined below.
-        
-        self.traj = TrajectoryPoint()
-
-    def compute_trajectory(self, context, discrete_state):
-        # Evaluate the input ports
-        self.ttime = context.get_time()
-        self.trajInit_ =self._trajInit_port.Eval(context)
-        self.trajEnd_ =self._trajEnd__port.Eval(context)
-
-        ddot_traj_c = -1.0 / (accDuration_**2 - trajDuration_ * accDuration_) * (self.trajEnd_ - self.trajInit_)
-
-        if self.ttime <= accDuration_:
-            self.traj.pos = self.trajInit_ + 0.5 * ddot_traj_c * self.ttime**2
-            self.traj.vel = ddot_traj_c * self.ttime
-            self.traj.acc = ddot_traj_c
-        elif self.ttime <= trajDuration_ - accDuration_:
-            self.traj.pos = self.trajInit_ + ddot_traj_c * accDuration_ * (self.ttime - accDuration_ / 2)
-            self.traj.vel = ddot_traj_c * accDuration_
-            self.traj.acc = np.zeros(3)
-        elif self.ttime <= trajDuration_:
-            self.traj.pos = self.trajEnd_ - 0.5 * ddot_traj_c * (trajDuration_ - self.ttime)**2
-            self.traj.vel = ddot_traj_c * (trajDuration_ - self.ttime)
-            self.traj.acc = -ddot_traj_c
-        else:
-            # After trajDuration_, hold the final position
-            self.traj.pos = trajEnd_
-            self.traj.vel = np.zeros(9)
-            self.traj.acc = np.zeros(9)
-        
-        # q_r = self.traj.pos
-        q_r = trajEnd_
-        # print(f"refrence = \n {q_r}")
-
-        # Write into the output vector.
-        discrete_state.get_mutable_vector().SetFromVector(q_r)
+# Define initial joint configuration for robot initialization
+trajInit_ = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
 
 
 ######################################################################################################
@@ -443,9 +392,6 @@ class ContactForceConverter(LeafSystem):
 box_id = plant.GetModelInstanceByName("movable_box")
 
 # Create systems
-init_pos = builder.AddNamedSystem("Initial position", ConstantVectorSource(trajInit_))
-end_pos = builder.AddNamedSystem("End position", ConstantVectorSource(trajEnd_))
-trajectory = builder.AddNamedSystem("Trajectory generator", motion_profile())
 erg_system = builder.AddNamedSystem("Trajectory-based ERG", ERG())
 pid_controller = builder.AddNamedSystem("PD+G controller", PD_gravity())
 
@@ -467,10 +413,6 @@ builder.Connect(plant.get_state_output_port(box_id),
 # Connect contact results to contact force converter
 builder.Connect(plant.get_contact_results_output_port(),
                contact_force_converter.GetInputPort("contact_results"))
-
-# Connect trajectory generator inputs
-builder.Connect(init_pos.GetOutputPort("y0"), trajectory.GetInputPort("trajInit_"))
-builder.Connect(end_pos.GetOutputPort("y0"), trajectory.GetInputPort("trajEnd_"))
 
 # Connect IK system to ERG (replacing the trajectory)
 builder.Connect(ik_box_tracker.GetOutputPort("ik_joint_targets"), 
@@ -548,6 +490,7 @@ builder.Connect(plant.get_state_output_port(panda_id),
 # Add logger for panda_link7 world positions from extractor
 logger_panda_link7_world = LogVectorOutput(panda_link7_extractor.GetOutputPort("panda_link7_world_positions"), builder)
 
+
 # Finalize the diagram
 diagram = builder.Build()
 diagram.set_name("diagram")
@@ -565,11 +508,11 @@ if simulate:
 
     # Define the step size and simulation time
     kStep = 0.001
-    sim_time = trajDuration_  # or whatever your total simulation time is
+    sim_time = 10.0  # Fixed simulation time since no trajectory duration
     simulator_context = simulator.get_mutable_context()
 
     print(f"Starting simulation for {sim_time} seconds...")
-    print(f"Initial positions: {trajInit_}")
+    print(f"Initial` positions: {trajInit_}")
     print("Using Relaxed IK to track box position!")
 
     # Run simulation
@@ -702,8 +645,8 @@ print(f"X range: [{np.min(panda_link7_positions[:, 0]):.4f}, {np.max(panda_link7
 print(f"Y range: [{np.min(panda_link7_positions[:, 1]):.4f}, {np.max(panda_link7_positions[:, 1]):.4f}] m")
 print(f"Z range: [{np.min(panda_link7_positions[:, 2]):.4f}, {np.max(panda_link7_positions[:, 2]):.4f}] m")
 
-# Identify modified joints (where values differ)
-modified_indices = np.where(trajInit_ != trajEnd_)[0]
+# Identify modified joints (comparing with initial configuration)
+modified_indices = np.where(trajInit_ != 0)[0]  # Find non-zero initial positions
 
 # Joint names and number of modified positions
 joint_names = ['Panda joint 1', 'Panda joint 2', 'Panda joint 3', 'Panda joint 4', 'Panda joint 5', 'Panda joint 6', 'Panda joint 7', 'panda_figer1', 'panda_figer2']

@@ -3,13 +3,22 @@ from pydrake.all import *
 import os
 import numpy as np
 
+# Import FCL for collision detection in predictions
+try:
+    from fcl_test import FCLLinkDistanceSystem
+    FCL_AVAILABLE = True
+except ImportError:
+    print("Warning: FCL not available. Collision detection in predictions will be disabled.")
+    FCL_AVAILABLE = False
+
+
 
 ####################################
 #     Create system diagram
 ####################################
 def create_system_model(plant, scene_graph):
     """
-    Add the Panda arm model to the plant and configure contact properties.
+    Add the Panda arm model and movable box to the plant and configure contact properties.
     
     Args:
         plant: The MultibodyPlant object to which the Panda arm model will be added.
@@ -18,7 +27,7 @@ def create_system_model(plant, scene_graph):
     Returns:
         Tuple containing the updated plant and scene_graph.
     """
-    urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3.urdf"))
+    urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
     urdf = "file://" + urdf_path
     arm = Parser(plant).AddModelsFromUrl(urdf)
     contact_model = ContactModel.kHydroelasticWithFallback  # Options: Hydroelastic, Point, or HydroelasticWithFallback
@@ -36,7 +45,8 @@ def create_system_model(plant, scene_graph):
 class ExplicitReferenceGovernor:
     def __init__(self, robust_delta_tau_, kappa_tau_, 
                  robust_delta_q_, kappa_q_, robust_delta_dq_, kappa_dq_, 
-                 robust_delta_dp_EE_, kappa_dp_EE_, kappa_terminal_energy_, FD_=1.0):
+                 robust_delta_dp_EE_, kappa_dp_EE_, kappa_terminal_energy_, FD_=1.0, 
+                 num_joints=7, urdf_path=None):
         """
         Initialize the Explicit Reference Governor (ERG) with given parameters.
         
@@ -51,14 +61,37 @@ class ExplicitReferenceGovernor:
             kappa_dp_EE_ (float): Scaling parameter for end-effector velocities.
             kappa_terminal_energy_ (float): Scaling parameter for terminal energy.
             FD_ (float): Force damping parameter for soft navigation field.
+            num_joints (int): Number of robot joints (default: 7 for Panda).
+            urdf_path (str): Path to URDF file (optional, uses default Panda if None).
         """
+        # Store num_joints parameter
+        self.num_joints = num_joints
+        
         # Plant Configuration parameters
         time_step = 0.01
         # PLant for simulation
         self.builder_pred = DiagramBuilder()
         self.plant_pred, scene_graph= AddMultibodyPlantSceneGraph(self.builder_pred, time_step)
-        self.plant_pred, scene_graph = create_system_model(self.plant_pred, scene_graph) 
+        
+        # Use provided URDF path or default Panda URDF
+        if urdf_path is None:
+            urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
+        
+        urdf = "file://" + urdf_path
+        arm = Parser(self.plant_pred).AddModelsFromUrl(urdf)
+        contact_model = ContactModel.kHydroelasticWithFallback
+        discrete_solver = DiscreteContactApproximation.kSap
+        mesh_type = HydroelasticContactRepresentation.kTriangle
+        self.plant_pred.set_contact_surface_representation(mesh_type)
+        self.plant_pred.set_contact_model(contact_model)
+        self.plant_pred.set_discrete_contact_approximation(discrete_solver)
+        self.plant_pred.Finalize() 
 
+        # Debug: Print plant information
+        print(f"ERG Plant num_positions: {self.plant_pred.num_positions()}")
+        print(f"ERG Plant num_velocities: {self.plant_pred.num_velocities()}")
+        print(f"ERG num_joints: {self.num_joints}")
+        
         # Finalize the diagram
         self.diagram = self.builder_pred.Build()                           
         self.diagram_context = self.diagram.CreateDefaultContext()    
@@ -69,9 +102,19 @@ class ExplicitReferenceGovernor:
         self.delta_q_ = 0.1 # threshold for when the repulsion effect starts to take place.
         self.dt_ = 0.01  # Sampling time for the refrence governor
 
-        # Controller gains
-        self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0]
-        self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0]
+        # Controller gains - dynamic based on num_joints
+        if num_joints == 7:
+            # Panda robot gains
+            self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0]
+            self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0]
+        elif num_joints == 9:
+            # Extended robot gains (7 original + 2 additional)
+            self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 10.0, 10.0]
+            self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+        else:
+            # Generic gains for other joint counts
+            self.Kp_ = [100.0] * num_joints
+            self.Kd_ = [5.0] * num_joints
 
         # Prediction parameters
         prediction_dt_ = time_step# 0.01  # Time step for predictions
@@ -93,6 +136,23 @@ class ExplicitReferenceGovernor:
         self.num_positions =  self.plant_pred.num_positions()
         self.num_velocities = self.plant_pred.num_velocities()
 
+        # Initialize FCL collision detection if available
+        self.fcl_available = FCL_AVAILABLE
+        if FCL_AVAILABLE:
+            try:
+                import fcl
+                self.fcl = fcl
+                print("FCL collision detection initialized successfully!")
+                
+                # Pre-build FCL collision objects for robot links
+                self._build_fcl_collision_objects()
+                
+            except Exception as e:
+                print(f"Failed to initialize FCL: {e}")
+                self.fcl_available = False
+        else:
+            print("FCL not available - collision detection disabled")
+
         # Prediction lists for joint positions, velocities, and torques
         self.q_pred_list_ = np.zeros((self.num_positions, self.num_pred_samples_ + 1))
         self.dq_pred_list_ = np.zeros((self.num_velocities, self.num_pred_samples_ + 1))
@@ -104,13 +164,119 @@ class ExplicitReferenceGovernor:
         # Order: panda_link1-7, panda_hand, panda_leftfinger, panda_rightfinger
         self.body_pose_list_ = np.zeros((10, 3, self.num_pred_samples_ + 1))
         
-        # Limits for joint angles, velocities, and torques
-        self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
-        self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
-        self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
-        self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
+        # Limits for joint angles, velocities, and torques - dynamic based on num_joints
+        if num_joints == 7:
+            # Panda robot limits
+            self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+            self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
+            self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
+            self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
+        elif num_joints == 9:
+            # Extended robot limits (7 original + 2 additional)
+            self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973, -3.14, -3.14])
+            self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973, 3.14, 3.14])
+            self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0, 10.0, 10.0])
+            self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100, 2.0, 2.0])
+        else:
+            # Generic limits for other joint counts
+            self.limit_q_min_ = np.array([-3.14] * num_joints)
+            self.limit_q_max_ = np.array([3.14] * num_joints)
+            self.limit_tau_ = np.array([50.0] * num_joints)
+            self.limit_dq_ = np.array([2.0] * num_joints)
         self.limit_dp_EE_ = [1.7, 2.5]  # Translation and rotation limits for the end effector
         self.E_max_ = 5.0  # Maximum energy limit
+
+    def _build_fcl_collision_objects(self):
+        """
+        Pre-build FCL collision objects for robot links with modular finger detection.
+        Uses fingers if found in URDF, otherwise uses rubber pad.
+        """
+        if not self.fcl_available:
+            return
+            
+        # Define base links that should always exist
+        base_link_names = ["panda_link7", "panda_hand"]
+        
+        # Try to detect fingers in the URDF
+        finger_names = ["panda_leftfinger", "panda_rightfinger"]
+        detected_fingers = []
+        
+        for finger_name in finger_names:
+            try:
+                body = self.plant_pred.GetBodyByName(finger_name)
+                detected_fingers.append(finger_name)
+                print(f"Detected finger: {finger_name}")
+            except Exception:
+                print(f"Finger {finger_name} not found in URDF")
+        
+        # If no fingers detected, use rubber pad
+        if not detected_fingers:
+            print("No fingers detected, using rubber pad")
+            # Try different rubber pad names
+            rubber_pad_names = ["rubber_pad", "panda_rubber_pad", "gripper_pad"]
+            rubber_pad_found = False
+            
+            for pad_name in rubber_pad_names:
+                try:
+                    body = self.plant_pred.GetBodyByName(pad_name)
+                    detected_fingers.append(pad_name)
+                    rubber_pad_found = True
+                    print(f"Using rubber pad: {pad_name}")
+                    break
+                except Exception:
+                    continue
+            
+            if not rubber_pad_found:
+                print("No rubber pad found, using panda_hand as fallback")
+                detected_fingers.append("panda_hand")
+        
+        # Build collision objects for all detected links
+        self.fcl_robot_links = []
+        all_link_names = base_link_names + detected_fingers
+        
+        for link_name in all_link_names:
+            try:
+                body = self.plant_pred.GetBodyByName(link_name)
+                
+                # Different box sizes for different link types
+                if "finger" in link_name.lower():
+                    # Smaller box for fingers
+                    geom = self.fcl.Box(0.05, 0.05, 0.05)  # 5cm cube for fingers
+                elif "rubber" in link_name.lower() or "pad" in link_name.lower():
+                    # Medium box for rubber pad
+                    geom = self.fcl.Box(0.08, 0.08, 0.08)  # 8cm cube for rubber pad
+                else:
+                    # Standard box for other links
+                    geom = self.fcl.Box(0.1, 0.1, 0.1)  # 10cm cube for other links
+                
+                collision_obj = self.fcl.CollisionObject(geom)
+                self.fcl_robot_links.append((body.index(), link_name, np.eye(4), collision_obj))
+                print(f"Built FCL collision object for: {link_name}")
+                
+            except Exception as e:
+                print(f"Failed to build FCL object for {link_name}: {e}")
+                # Add dummy object as fallback
+                geom = self.fcl.Box(0.1, 0.1, 0.1)
+                collision_obj = self.fcl.CollisionObject(geom)
+                self.fcl_robot_links.append((self.plant_pred.world_body().index(), link_name, np.eye(4), collision_obj))
+        
+        print(f"Built {len(self.fcl_robot_links)} FCL collision objects")
+        print(f"Link names: {[name for _, name, _, _ in self.fcl_robot_links]}")
+
+    def _update_fcl_objects_from_context(self, context):
+        """
+        Update FCL collision object transforms based on current plant context.
+        """
+        if not self.fcl_available:
+            return
+            
+        for bidx, _name, T_LC, obj in self.fcl_robot_links:
+            if bidx == self.plant_pred.world_body().index():
+                continue
+            body = self.plant_pred.get_body(bidx)
+            T_WL = self.plant_pred.EvalBodyPoseInWorld(context, body).GetAsMatrix4()
+            T_WC = T_WL @ T_LC
+            obj.setTransform(self.fcl.Transform(T_WC[:3, :3], T_WC[:3, 3]))
 
     def get_qv(self, q, dq, tau, q_r, q_v, box_position=None):
         """
@@ -158,7 +324,7 @@ class ExplicitReferenceGovernor:
             float: Calculated total energy.
         """
         # Get trajectory predictions and return the calculated energy
-        total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
+        total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v, box_position)
         # print(f"Total energy: {total_energy}")
         return total_energy
 
@@ -176,7 +342,7 @@ class ExplicitReferenceGovernor:
         # print(f"rho_att = \n {rho_att}")
 
         # Joint angle repulsion field (q)
-        for i in range(7):
+        for i in range(self.num_joints):
             rho_rep_q[i] = max((self.zeta_q_ - abs(q_v[i] - self.limit_q_min_[i])) / (self.zeta_q_ - self.delta_q_), 0.0) - \
                            max((self.zeta_q_ - abs(q_v[i] - self.limit_q_max_[i])) / (self.zeta_q_ - self.delta_q_), 0.0)
         # print(f"norm rho_rep_q = {np.linalg.norm(rho_rep_q)}")
@@ -188,7 +354,7 @@ class ExplicitReferenceGovernor:
             rho_soft = self.soft_navigation_field(box_position_constraint, q_v)
 
         # Total navigation field
-        rho = rho_att + rho_rep_q + rho_soft
+        rho = rho_att 
         return rho
 
     def soft_navigation_field(self, box_position_constraint, q_v):
@@ -315,34 +481,27 @@ class ExplicitReferenceGovernor:
             norm_qdot = np.linalg.norm(qdot)
             normalized_q_dot = qdot / max(norm_qdot, eta_)
             normalized_q_dots.append(normalized_q_dot)
-        
-        # Calculate soft repulsion for each link (only for the 7 main joints)
-        for i in range(1, 8):  # Only process links 1-7 (panda_link1 to panda_link7)
-            if i >= len(link_positions):
-                break  # Safety check in case link_positions has fewer than 7 elements
-                
+        # print(type(min(self.num_joints + 1, len(link_positions))))
+        # Calculate soft repulsion for each link (only for the main joints)
+        for i in range(1, int(min(self.num_joints + 1, len(link_positions)))):  # Process links 1 to num_joints
             link_pos = link_positions[i]
             
             # Calculate scale factor using individual joint KP gains
             w = box_position_constraint[0]  # Use only the x-component of box position
             dot_product = np.dot(c, link_pos)
             
-            # Debug: Check types and values
-
-            
             # Ensure all components are scalars
             w_scalar = float(w)
             dot_product_scalar = float(dot_product)
-            kp_scalar = float(self.Kp_[i-1])  # Safe to access since we only go up to i=7
+            kp_scalar = float(self.Kp_[i-1])  # Safe to access since we only go up to num_joints
             delta_s_scalar = float(delta_s)
             fd_scalar = float(self.FD_)
             
             scale_value = -kp_scalar * ((w_scalar + dot_product_scalar) / (delta_s_scalar * fd_scalar))
             scale = max(scale_value, 0.0)  # Ensure scalar result
-
             
             # Add to soft repulsion vector
-            soft_rep[:7] += scale * normalized_q_dots[i-1][:7]  # Apply to first 7 joints
+            soft_rep[:self.num_joints] += scale * normalized_q_dots[i-1][:self.num_joints]  # Apply to all joints
         
         return soft_rep
 
@@ -352,7 +511,7 @@ class ExplicitReferenceGovernor:
       """
       # Get trajectory predictions and save predicted q, dq, and tau in lists
       start_time = time.time()
-      total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v)
+      total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v, box_position)
 
       # Compute DSMs
       DSM_tau_ = self.dsmTau()
@@ -370,7 +529,7 @@ class ExplicitReferenceGovernor:
       # DSM = min(DSM,DSM_terminal_energy_)
 
       DSM = max(DSM, 0)
-      # DSM =1.0
+    #   DSM =1.0
     # Print DSMs
     #   print(f"DSM_tau_: {DSM_tau_}")
     #   print(f"DSM_q_: {DSM_q_}")
@@ -380,11 +539,17 @@ class ExplicitReferenceGovernor:
       
       return DSM
 
-    def trajectoryPredictions(self, state, tau, q_v):
+    def trajectoryPredictions(self, state, tau, q_v, box_position=None):
         """
         Predict joint positions, velocities, and torques over the prediction horizon.
+        
+        Args:
+            state: Current state [q, dq]
+            tau: Current torques
+            q_v: Reference joint positions
+            box_position: Box position [x, y, z] for collision detection
         """
-        q_pred, dq_pred = state[:self.num_positions], state[self.num_positions:]
+        q_pred, dq_pred = state[:self.num_joints], state[self.num_joints:]
         tau_pred = tau
 
         # Calculate energy at the beginning of trajectory prediction
@@ -403,8 +568,8 @@ class ExplicitReferenceGovernor:
             kinetic_energy = 0.5 * dq_pred.T @ mass_matrix @ dq_pred
             
             # Potential energy: 0.5 * position_error^T * Kp_diagonal_matrix * position_error
-            # Use only first 7 joints for Kp gains (matching the controller)
-            position_error = q_v[:7] - q_pred[:7]
+            # Use joints based on num_joints
+            position_error = q_v[:self.num_joints] - q_pred[:self.num_joints]
             Kp_diag_matrix = np.diag(self.Kp_)  # Create diagonal matrix from Kp gains
             potential_energy = 0.5 * position_error.T @ Kp_diag_matrix @ position_error
             
@@ -495,10 +660,10 @@ class ExplicitReferenceGovernor:
 
 
             # Compute tau_pred
-            tau_pred_partial = self.Kp_ * (q_v[:7] - q_pred[:7]) - self.Kd_ * dq_pred[:7] +gravity_pred[:7]
-            tau_pred = np.zeros(9)
-            tau_pred[:7] = tau_pred_partial
-            tau_pred[7:] = 0  # or some other feedforward/zero torque for extra joints
+            tau_pred_partial = self.Kp_ * (q_v[:self.num_joints] - q_pred[:self.num_joints]) - self.Kd_ * dq_pred[:self.num_joints] + gravity_pred[:self.num_joints]
+            tau_pred = np.zeros(self.num_positions)
+            tau_pred[:self.num_joints] = tau_pred_partial
+            tau_pred[self.num_joints:] = 0  # Zero torque for extra joints
 
 
 
@@ -522,8 +687,30 @@ class ExplicitReferenceGovernor:
             # Store body pose from calc_dynamics return
             # body_pose_translation contains poses for all 7 links + panda_hand + 2 fingers
             # Store in body_pose_list_ for this prediction step
-            for link_idx in range(10):
+            for link_idx in range(8):
                 self.body_pose_list_[link_idx, :, k + 1] = body_pose_translation[:, link_idx]
+            
+            # Get FCL distances if available
+            if self.fcl_available and box_position is not None:
+                try:
+                    # Get FCL normal distances from robot links to box
+                    fcl_distances = self.get_fcl_distances(q_pred, box_position)
+                    if fcl_distances is not None:
+                        # Dynamic print based on actual number of collision objects
+                        link_names = [name for _, name, _, _ in self.fcl_robot_links]
+                        distance_str = ", ".join([f"{name}={dist:.4f}" for name, dist in zip(link_names, fcl_distances)])
+                        print(f"FCL normal distances in prediction step {k+1}: {distance_str}")
+                    
+                    # Get FCL X-axis distances from robot links to box
+                    fcl_x_distances = self.get_fcl_x_distances(q_pred, box_position)
+                    if fcl_x_distances is not None:
+                        # Dynamic print based on actual number of collision objects
+                        link_names = [name for _, name, _, _ in self.fcl_robot_links]
+                        distance_str = ", ".join([f"{name}={dist:.4f}" for name, dist in zip(link_names, fcl_x_distances)])
+                        print(f"FCL X-axis distances in prediction step {k+1}: {distance_str}")
+                        
+                except Exception as e:
+                    print(f"FCL distance calculation failed in prediction: {e}")
 
         # Convert lists to arrays for plotting
         q_pred_traj = np.array(q_pred_traj)
@@ -532,7 +719,146 @@ class ExplicitReferenceGovernor:
 
         return total_energy
 
-    # Calculate system dynamics
+    def get_fcl_distances(self, q_pred, box_position=None):
+        """
+        Get FCL distances from robot links to box.
+        Creates collision objects dynamically based on box position.
+        
+        Args:
+            q_pred: Predicted joint positions
+            box_position: Box position [x, y, z] (optional)
+        
+        Returns:
+            List of distances [link7, hand, leftfinger, rightfinger] or None if not available
+        """
+        if not self.fcl_available or box_position is None:
+            return None
+            
+        try:
+            # Set plant to predicted configuration
+            self.plant_pred.SetPositions(self.plant_context, q_pred)
+            
+            # Create FCL collision objects for robot links
+            robot_links = []
+            link_names = ["panda_link7", "panda_hand", "panda_leftfinger", "panda_rightfinger"]
+            
+            for link_name in link_names:
+                try:
+                    body = self.plant_pred.GetBodyByName(link_name)
+                    body_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body)
+                    link_position = body_pose.translation()
+                    
+                    # Create 10cm cube collision object for each link
+                    geom = self.fcl.Box(0.1, 0.1, 0.1)
+                    collision_obj = self.fcl.CollisionObject(geom)
+                    collision_obj.setTransform(self.fcl.Transform(link_position))
+                    robot_links.append(collision_obj)
+                except Exception:
+                    robot_links.append(None)
+            
+            # Create FCL collision object for box
+            box_geom = self.fcl.Box(0.22, 0.30, 0.20)  # Box dimensions
+            box_collision_obj = self.fcl.CollisionObject(box_geom)
+            box_collision_obj.setTransform(self.fcl.Transform(box_position))
+            
+            # Calculate distances between robot links and box
+            distances = []
+            for i, robot_link in enumerate(robot_links):
+                if robot_link is not None:
+                    # Calculate distance between robot link and box
+                    req = self.fcl.DistanceRequest(enable_signed_distance=True)
+                    res = self.fcl.DistanceResult()
+                    distance = self.fcl.distance(robot_link, box_collision_obj, req, res)
+                    distances.append(distance)
+                else:
+                    distances.append(float('inf'))  # Link not found
+            
+            return distances
+            
+        except Exception as e:
+            print(f"FCL distance calculation failed: {e}")
+            return None
+
+    def get_fcl_distances_axis(self, q_pred, box_position=None, axis='x'):
+        """
+        Get FCL distances from robot links to box in a specific axis using pre-built collision objects.
+        
+        Args:
+            q_pred: Predicted joint positions
+            box_position: Box position [x, y, z] (optional)
+            axis: 'x', 'y', or 'z' axis to measure distance along (default: 'x')
+        
+        Returns:
+            List of distances along specified axis [link7, hand, finger1, finger2] or None
+        """
+        if not self.fcl_available or box_position is None:
+            return None
+            
+        try:
+            # Set plant to predicted configuration
+            self.plant_pred.SetPositions(self.plant_context, q_pred)
+            
+            # Update pre-built FCL collision objects with current poses
+            self._update_fcl_objects_from_context(self.plant_context)
+            
+            # Create FCL collision object for box
+            box_geom = self.fcl.Box(0.22, 0.30, 0.20)  # Box dimensions
+            box_collision_obj = self.fcl.CollisionObject(box_geom)
+            box_collision_obj.setTransform(self.fcl.Transform(box_position))
+            
+            # Calculate axis-specific distances between robot links and box
+            distances = []
+            axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis.lower()]
+            
+            for (bidx, link_name, T_LC, robot_obj) in self.fcl_robot_links:
+                if bidx != self.plant_pred.world_body().index():  # Skip dummy objects
+                    # Calculate distance between robot link and box
+                    req = self.fcl.DistanceRequest(enable_signed_distance=True, enable_nearest_points=True)
+                    res = self.fcl.DistanceResult()
+                    distance = self.fcl.distance(robot_obj, box_collision_obj, req, res)
+                    
+                    # Get nearest points and calculate axis distance
+                    try:
+                        nearest_point_robot = np.array(res.nearest_points[0])
+                        nearest_point_box = np.array(res.nearest_points[1])
+                        
+                        # Calculate distance along specific axis: box_axis - robot_axis
+                        axis_distance = nearest_point_box[axis_idx] - nearest_point_robot[axis_idx]
+                        distances.append(axis_distance)
+                        
+                        # Debug print for X-axis
+                        if axis.lower() == 'x':
+                            print(f"FCL {axis}-axis distance for {link_name}: {axis_distance:.4f} m")
+                            print(f"  Robot point: {nearest_point_robot}")
+                            print(f"  Box point: {nearest_point_box}")
+                            print(f"  Distance vector: {nearest_point_box - nearest_point_robot}")
+                        
+                    except Exception as e:
+                        print(f"Failed to get nearest points for {link_name}: {e}")
+                        # Fallback to overall distance if nearest points not available
+                        distances.append(distance)
+                else:
+                    distances.append(float('inf'))  # Dummy object
+            
+            return distances
+            
+        except Exception as e:
+            print(f"FCL axis distance calculation failed: {e}")
+            return None
+
+    def get_fcl_x_distances(self, q_pred, box_position=None):
+        """
+        Get FCL X-axis distances from robot links to box.
+        Convenience method that returns only X distances.
+        
+        Args:
+            q_pred: Predicted joint positions
+            box_position: Box position [x, y, z] (optional)
+        
+        Returns:
+            List of X distances [link7, hand, finger1, finger2] or None
+        """
+        return self.get_fcl_distances_axis(q_pred, box_position, axis='x')
     '''
     TamsiSolver uses the Transition-Aware Modified Semi-Implicit (TAMSI) method, [Castro et al., 2019], 
     to solve the equations below for mechanical systems in contact with regularized friction:
@@ -584,14 +910,15 @@ class ExplicitReferenceGovernor:
         # PD controller with gravity compensation
         kp = np.array(self.Kp_)
         kd = np.array(self.Kd_)
-        U = 7  # Number of actual robot joints (excluding extra joints)
+        U = self.num_joints  # Number of actual robot joints
         
         # Control law: u = kp * (qv - q) + kd * dq - tau_g
-        # Only apply control to the first 7 joints
-        u_control = kp * (qv[:7] - q[:7]) - kd * dq[:7] - tau_g[:7]
+        # Apply control to the robot joints
+        u_control = kp * (qv[:U] - q[:U]) - kd * dq[:U] - tau_g[:U]
         
-        # Add 2 zeros at the end for the extra joints
-        u_control = np.concatenate([u_control, [0, 0]])
+        # Add zeros for any extra joints beyond num_joints
+        if self.num_positions > U:
+            u_control = np.concatenate([u_control, np.zeros(self.num_positions - U)])
         
         # End effector control (commented out in original)
         # J_pseudo = J.completeOrthogonalDecomposition().pseudoInverse()
@@ -782,7 +1109,7 @@ class ExplicitReferenceGovernor:
         return wall
 
     def distanceTau(self, tau_pred):
-        for i in range(7):
+        for i in range(self.num_joints):
             tau_lowerlimit = tau_pred[i] - (-self.limit_tau_[i])
             tau_upperlimit = self.limit_tau_[i] - tau_pred[i]
             tau_distance_temp = min(tau_lowerlimit, tau_upperlimit)
@@ -793,7 +1120,7 @@ class ExplicitReferenceGovernor:
         return tau_distance
 
     def distanceQ(self, q_pred):
-        for i in range(7):  # include all joints
+        for i in range(self.num_joints):  # include all joints
             q_lowerlimit = q_pred[i] - self.limit_q_min_[i]
             q_upperlimit = self.limit_q_max_[i] - q_pred[i]
             q_distance_temp = min(q_lowerlimit, q_upperlimit)
@@ -805,7 +1132,7 @@ class ExplicitReferenceGovernor:
         return q_distance
 
     def distanceDq(self, dotq_pred):
-        for i in range(7):
+        for i in range(self.num_joints):
             distance_dotq_lowerlimit = dotq_pred[i] - (-self.limit_dq_[i])
             distance_dotq_upperlimit = self.limit_dq_[i] - dotq_pred[i]
             distance_dotq_temp = min(distance_dotq_lowerlimit, distance_dotq_upperlimit)
