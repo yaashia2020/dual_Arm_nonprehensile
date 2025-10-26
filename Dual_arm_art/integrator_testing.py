@@ -207,8 +207,7 @@ class RelaxedIKBoxTracker(LeafSystem):
 
         # ---- IO ----
         self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
-        self._z_adjusted_target_port = self.DeclareVectorInputPort(name="z_adjusted_target", size=3,  # optional
-                                                                   abstract_val=AbstractValue.Make([0.0, 0.0, 0.0]))
+        self._z_adjusted_target_port = self.DeclareVectorInputPort(name="z_adjusted_target", size=3)
         state_index = self.DeclareDiscreteState(num_joints)
         self.DeclareStateOutputPort("ik_joint_targets", state_index)
 
@@ -280,8 +279,14 @@ class RelaxedIKBoxTracker(LeafSystem):
                 # print(f"[Init] Using actual EE start pos as hold position: {self._hold_pos}")
 
             # ===== Get z-adjusted target from z_integrator =====
-            z_integrator_output = self._z_adjusted_target_port.Eval(context)
-            z_integrated_offset = z_integrator_output[2]  # The integrated Z offset
+            # Get integrated Z offset (default to 0 if not available)
+            z_integrated_offset = 0.0
+            try:
+                if self._z_adjusted_target_port.HasValue(context):
+                    z_integrator_output = self._z_adjusted_target_port.Eval(context)
+                    z_integrated_offset = z_integrator_output[2]  # The integrated Z offset
+            except:
+                pass  # Use default 0.0
             
             # ===== Phase selection =====
             if t <= self.t_orient:
@@ -873,9 +878,9 @@ builder.Connect(plant.get_contact_results_output_port(),
 # Add Z-axis integrator system with two inputs
 z_integrator = builder.AddNamedSystem("ZAxisIntegrator", 
                                      make_integrate_z_two_in_block(
-                                         Ki_z=2,  # Integral gain for Z (reduced for stability)
+                                         Ki_z=0.7,  # Integral gain for Z (reduced for stability)
                                          z_min=-0.5,  # Minimum Z limit
-                                         z_max=1,   # Maximum Z limit
+                                         z_max=0.2,   # Maximum Z limit
                                          Kaw_z=0.1,   # Anti-windup gain
                                          error_mode="a_minus_b",  # a.z - b.z
                                          passthrough_xy_from="a",  # Use X,Y from first input

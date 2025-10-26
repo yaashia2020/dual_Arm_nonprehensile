@@ -56,8 +56,8 @@
           <drake:rigid_hydroelastic/>
   <!-- Rigid doesn’t use hydroelastic_modulus; remove it if present -->
           <drake:hunt_crossley_dissipation>1.0</drake:hunt_crossley_dissipation>
-          <drake:mu_static>0.60</drake:mu_static>
-          <drake:mu_dynamic>0.55</drake:mu_dynamic>
+          <drake:mu_static>0.8</drake:mu_static>
+          <drake:mu_dynamic>0.79</drake:mu_dynamic>
           <!-- <drake:resolution_hint>0.03</drake:resolution_hint> -->
         </drake:proximity_properties>
       </collision>
