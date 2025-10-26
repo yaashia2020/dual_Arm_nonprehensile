@@ -47,11 +47,16 @@
 
         <!-- Enable soft hydroelastic contact (can be modified)-->
         <drake:proximity_properties>
-          <drake:compliant_hydroelastic />
+          <!-- <drake:compliant_hydroelastic /> -->
           <!-- <drake:hydroelastic_modulus>1e8</drake:hydroelastic_modulus> -->
-          <drake:hydroelastic_modulus>1e7</drake:hydroelastic_modulus>
+          <!-- <drake:hydroelastic_modulus>1e7</drake:hydroelastic_modulus> -->
+          <!-- <drake:hunt_crossley_dissipation>1.0</drake:hunt_crossley_dissipation> -->
+          <!-- <drake:mu_static>0.6</drake:mu_static> -->
+          <!-- <drake:mu_dynamic>0.55</drake:mu_dynamic> -->
+          <drake:rigid_hydroelastic/>
+  <!-- Rigid doesn’t use hydroelastic_modulus; remove it if present -->
           <drake:hunt_crossley_dissipation>1.0</drake:hunt_crossley_dissipation>
-          <drake:mu_static>0.6</drake:mu_static>
+          <drake:mu_static>0.60</drake:mu_static>
           <drake:mu_dynamic>0.55</drake:mu_dynamic>
           <!-- <drake:resolution_hint>0.03</drake:resolution_hint> -->
         </drake:proximity_properties>

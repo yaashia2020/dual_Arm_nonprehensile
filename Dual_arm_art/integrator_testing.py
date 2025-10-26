@@ -2,7 +2,10 @@ import numpy as np
 import time
 import numpy as np
 import matplotlib.pyplot as plt
-import csv  
+import csv
+
+# Enable interactive plotting to keep windows open
+plt.ion()  
 from pydrake.all import *
 # import pydot
 from IPython.display import SVG, display
@@ -88,19 +91,19 @@ def create_system_model(plant, scene_graph):
     
     # Debug: Check how many positions the robot actually has
     num_robot_positions = int(plant.num_positions(panda_id))
-    print(f"Robot has {num_robot_positions} positions")
-    print(f"Type of num_robot_positions: {type(num_robot_positions)}")
+    # print(f"Robot has {num_robot_positions} positions")
+    # print(f"Type of num_robot_positions: {type(num_robot_positions)}")
     
     # Debug: Print the IDs and box setup
-    print(f"Fixed box ID: {fixed_box_id}")
-    print(f"Middle fixed box ID: {middle_fixed_box_id}")
-    print(f"Movable box ID: {movable_box_id}")
-    print(f"Back fixed box ID: {back_fixed_box_id}")
-    print("Box setup:")
-    print("  - Fixed box (ground): Z=0.1")
-    print("  - Middle fixed box: X=0.7, Z=0.25, height=0.4m")
-    print("  - Movable box: X=0.7, Z=0.55, height=0.2m")
-    print("  - Back fixed box: X=1.0, Z=0.4, height=0.8m (behind in X-axis)")
+    # print(f"Fixed box ID: {fixed_box_id}")
+    # print(f"Middle fixed box ID: {middle_fixed_box_id}")
+    # print(f"Movable box ID: {movable_box_id}")
+    # print(f"Back fixed box ID: {back_fixed_box_id}")
+    # print("Box setup:")
+    # print("  - Fixed box (ground): Z=0.1")
+    # print("  - Middle fixed box: X=0.7, Z=0.25, height=0.4m")
+    # print("  - Movable box: X=0.7, Z=0.55, height=0.2m")
+    # print("  - Back fixed box: X=1.0, Z=0.4, height=0.8m (behind in X-axis)")
     
     # Set appropriate number of default positions
     if num_robot_positions == 7:
@@ -111,7 +114,7 @@ def create_system_model(plant, scene_graph):
         plant.SetDefaultPositions(panda_id, [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0])
     else:
         # Unknown number of joints - use zeros
-        print(f"Warning: Unknown number of joints ({num_robot_positions}), using zeros")
+        # print(f"Warning: Unknown number of joints ({num_robot_positions}), using zeros")
         plant.SetDefaultPositions(panda_id, [0.0] * num_robot_positions)
     
     return plant, scene_graph, plant_context, num_robot_positions, fixed_box_id, middle_fixed_box_id, movable_box_id, back_fixed_box_id
@@ -164,12 +167,13 @@ movable_box_id = plant.GetModelInstanceByName("movable_box")
 try:
     box_body = plant.GetBodyByName("box_link", movable_box_id)
     box_pose = plant.EvalBodyPoseInWorld(plant_context, box_body)
-    print(f"Box pose translation: {box_pose.translation()}")
-    print(f"Box pose rotation (quaternion): {box_pose.rotation().ToQuaternion().wxyz()}")
+    # print(f"Box pose translation: {box_pose.translation()}")
+    # print(f"Box pose rotation (quaternion): {box_pose.rotation().ToQuaternion().wxyz()}")
 except Exception as e:
-    print(f"Could not get box pose: {e}")
+    # print(f"Could not get box pose: {e}")
+    pass
 
-print("=" * 40)
+# print("=" * 40)
 
 ######################################################################################################
 #              ##################Relaxed IK System for Box Tracking################
@@ -203,6 +207,8 @@ class RelaxedIKBoxTracker(LeafSystem):
 
         # ---- IO ----
         self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
+        self._z_adjusted_target_port = self.DeclareVectorInputPort(name="z_adjusted_target", size=3,  # optional
+                                                                   abstract_val=AbstractValue.Make([0.0, 0.0, 0.0]))
         state_index = self.DeclareDiscreteState(num_joints)
         self.DeclareStateOutputPort("ik_joint_targets", state_index)
 
@@ -217,9 +223,9 @@ class RelaxedIKBoxTracker(LeafSystem):
             )
             self.rik = RelaxedIKRust(setting_file_path=config_path)
             self.ik_available = True
-            print("Relaxed IK initialized successfully for box tracking!")
+            # print("Relaxed IK initialized successfully for box tracking!")
         except Exception as e:
-            print(f"Failed to initialize Relaxed IK: {e}")
+            # print(f"Failed to initialize Relaxed IK: {e}")
             self.ik_available = False
 
         # fallback joints
@@ -229,7 +235,7 @@ class RelaxedIKBoxTracker(LeafSystem):
             self.fallback_joints = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.0, 0.0]
         else:
             self.fallback_joints = [0.0] * num_joints
-            print(f"Warning: Using zero fallback joints for {num_joints} joints")
+            # print(f"Warning: Using zero fallback joints for {num_joints} joints")
 
     def solve_ik(self, context, discrete_state):
         if not self.ik_available:
@@ -256,7 +262,7 @@ class RelaxedIKBoxTracker(LeafSystem):
                             break
                     
                     if robot_id is None:
-                        print("Warning: Could not find robot model instance")
+                        # print("Warning: Could not find robot model instance")
                         discrete_state.get_mutable_vector().SetFromVector(self.fallback_joints)
                         return
 
@@ -271,8 +277,12 @@ class RelaxedIKBoxTracker(LeafSystem):
                 ee_pose = self.plant.EvalBodyPoseInWorld(self.plant_context, ee_body)
                 self._hold_pos = ee_pose.translation().tolist()
 
-                print(f"[Init] Using actual EE start pos as hold position: {self._hold_pos}")
+                # print(f"[Init] Using actual EE start pos as hold position: {self._hold_pos}")
 
+            # ===== Get z-adjusted target from z_integrator =====
+            z_integrator_output = self._z_adjusted_target_port.Eval(context)
+            z_integrated_offset = z_integrator_output[2]  # The integrated Z offset
+            
             # ===== Phase selection =====
             if t <= self.t_orient:
                 # Phase 1: orientation-only — hold position fixed, aim for desired orientation
@@ -281,7 +291,12 @@ class RelaxedIKBoxTracker(LeafSystem):
                 tol              = self.tol_orient
             else:
                 # Phase 2/3: face-tracking (XY) + optional Z lift after t_lift_start
-                z_target = z_b if t < self.t_lift_start else (z_b + self.lift_amount)
+                # Compute base target Z
+                z_target_base = z_b if t < self.t_lift_start else (z_b + self.lift_amount)
+                
+                # Add integrated offset from z_integrator
+                z_target = z_target_base + z_integrated_offset
+                
                 x_face   = x_b - (self.box_half_x + self.pad_close)
                 target_position  = [x_face, y_b, z_target]
                 target_quat_xyzw = self.desired_quat_xyzw
@@ -292,9 +307,9 @@ class RelaxedIKBoxTracker(LeafSystem):
                 "orient-only" if t <= self.t_orient
                 else ("approach" if t < self.t_lift_start else "lift")
             )
-            print(f"\n=== RelaxedIK (t={t:.2f}) Phase: {phase} ===")
-            print(f"Box: [{x_b:.3f}, {y_b:.3f}, {z_b:.3f}]  Target: {target_position}")
-            print(f"Quat(xyzw): {target_quat_xyzw}")
+            # print(f"\n=== RelaxedIK (t={t:.2f}) Phase: {phase} ===")
+            # print(f"Box: [{x_b:.3f}, {y_b:.3f}, {z_b:.3f}]  Target: {target_position}")
+            # print(f"Quat(xyzw): {target_quat_xyzw}")
 
             # ---- Solve IK ----
             joint_solution = self.rik.solve_position(target_position, target_quat_xyzw, tol)
@@ -305,13 +320,13 @@ class RelaxedIKBoxTracker(LeafSystem):
             elif len(joint_solution) == 7 and self.num_joints == 9:
                 full_solution = list(joint_solution) + [0.0, 0.0]
             else:
-                print(f"Warning: Solution length {len(joint_solution)} != expected {self.num_joints}, using fallback")
+                # print(f"Warning: Solution length {len(joint_solution)} != expected {self.num_joints}, using fallback")
                 full_solution = self.fallback_joints
 
             discrete_state.get_mutable_vector().SetFromVector(full_solution)
 
         except Exception as e:
-            print(f"IK solving failed: {e}")
+            # print(f"IK solving failed: {e}")
             discrete_state.get_mutable_vector().SetFromVector(self.fallback_joints)
 
 ######################################################################################################
@@ -420,7 +435,7 @@ class PD_gravity(LeafSystem):
             # Default gains for unknown number of joints
             self.Kp_ = [100.0] * num_joints
             self.Kd_ = [5.0] * num_joints
-            print(f"Warning: Using default gains for {num_joints} joints")
+            # print(f"Warning: Using default gains for {num_joints} joints")
 
         # Declare discrete state and output with dynamic size
         state_index = self.DeclareDiscreteState(num_joints)
@@ -471,12 +486,12 @@ class ContactForceConverter(LeafSystem):
         
         # Check if there are any contacts
         if contact_results.num_point_pair_contacts() == 0:
-            print("No contacts detected")
+            # print("No contacts detected")
             return
         
         # Get number of contacts
         num_contacts = contact_results.num_point_pair_contacts()
-        print(f"Total contacts detected: {num_contacts}")
+        # print(f"Total contacts detected: {num_contacts}")
         
         # Define robot links to check for contacts - including all hand components
         robot_links = [
@@ -505,7 +520,7 @@ class ContactForceConverter(LeafSystem):
             bodyA_name = self.plant.get_body(bodyA_idx).name()
             bodyB_name = self.plant.get_body(bodyB_idx).name()
             
-            print(f"Contact {i}: {bodyA_name} <-> {bodyB_name}")
+            # print(f"Contact {i}: {bodyA_name} <-> {bodyB_name}")
             
             # Check if this contact is between any robot link and box
             if ((bodyA_name == object_name or bodyB_name == object_name) and
@@ -513,30 +528,30 @@ class ContactForceConverter(LeafSystem):
                 
                 robot_box_contacts += 1
                 force = contact_info.contact_force()
-                print(f"  Robot-Box contact detected! Force: [{force[0]:.3f}, {force[1]:.3f}, {force[2]:.3f}]")
+                # print(f"  Robot-Box contact detected! Force: [{force[0]:.3f}, {force[1]:.3f}, {force[2]:.3f}]")
                 
                 # Categorize contact type
                 contact_body = bodyA_name if bodyA_name in robot_links else bodyB_name
                 if "finger" in contact_body:
                     finger_contacts += 1
-                    print(f"    -> Finger contact detected on {contact_body}")
+                    # print(f"    -> Finger contact detected on {contact_body}")
                 elif contact_body == "panda_hand":
                     hand_contacts += 1
-                    print(f"    -> Hand contact detected on {contact_body}")
+                    # print(f"    -> Hand contact detected on {contact_body}")
                 else:
                     arm_contacts += 1
-                    print(f"    -> Arm link contact detected on {contact_body}")
+                    # print(f"    -> Arm link contact detected on {contact_body}")
                 
                 # Extract contact force and add to total
                 total_force[0] += force[0]
                 total_force[1] += force[1]
                 total_force[2] += force[2]
         
-        print(f"Robot-Box contacts: {robot_box_contacts}")
-        print(f"  - Arm link contacts: {arm_contacts}")
-        print(f"  - Hand contacts: {hand_contacts}")
-        print(f"  - Finger contacts: {finger_contacts}")
-        print(f"Total force: [{total_force[0]:.3f}, {total_force[1]:.3f}, {total_force[2]:.3f}]")
+        # print(f"Robot-Box contacts: {robot_box_contacts}")
+        # print(f"  - Arm link contacts: {arm_contacts}")
+        # print(f"  - Hand contacts: {hand_contacts}")
+        # print(f"  - Finger contacts: {finger_contacts}")
+        # print(f"Total force: [{total_force[0]:.3f}, {total_force[1]:.3f}, {total_force[2]:.3f}]")
         
         # Set the total contact force
         output.SetFromVector(total_force)
@@ -588,7 +603,7 @@ builder.Connect(plant.GetOutputPort("panda_net_actuation"), erg_system.GetInputP
 if meshcat_visualisation:
     meshcat = StartMeshcat()
     AddDefaultVisualization(builder=builder, meshcat=meshcat)
-    print(f"MeshCat visualization available at: {meshcat.web_url()}")
+    # print(f"MeshCat visualization available at: {meshcat.web_url()}")
 
 logger_x = LogVectorOutput(plant.get_state_output_port(), builder) #state
 logger_tau = LogVectorOutput(pid_controller.GetOutputPort("tau_u"), builder) #tau_u
@@ -624,30 +639,30 @@ class PandaLink7PoseExtractor(LeafSystem):
         full_state = self.GetInputPort("joint_positions").Eval(context)
         
         # Debug: Print state information
-        print(f"Full state size: {len(full_state)}")
-        print(f"Expected num_joints: {self.num_joints}")
-        print(f"Plant num_positions for panda: {self.plant.num_positions(self.panda_id)}")
+        # print(f"Full state size: {len(full_state)}")
+        # print(f"Expected num_joints: {self.num_joints}")
+        # print(f"Plant num_positions for panda: {self.plant.num_positions(self.panda_id)}")
         
         # Extract only joint positions (first num_joints elements)
         # The state vector is [q1, q2, ..., qn, dq1, dq2, ..., dqn]
         joint_positions = full_state[:self.num_joints]
         
-        print(f"Extracted joint_positions size: {len(joint_positions)}")
-        print(f"Joint positions: {joint_positions}")
+        # print(f"Extracted joint_positions size: {len(joint_positions)}")
+        # print(f"Joint positions: {joint_positions}")
         
         # Set the plant to these joint positions in temporary context
         # Use the correct model instance and context
         try:
             self.plant.SetPositions(self.temp_context, self.panda_id, joint_positions)
-            print("SetPositions successful!")
+            # print("SetPositions successful!")
         except Exception as e:
-            print(f"SetPositions failed: {e}")
+            # print(f"SetPositions failed: {e}")
             # Fallback: try without model instance
             try:
                 self.plant.SetPositions(self.temp_context, joint_positions)
-                print("SetPositions successful (without model instance)!")
+                # print("SetPositions successful (without model instance)!")
             except Exception as e2:
-                print(f"SetPositions failed even without model instance: {e2}")
+                # print(f"SetPositions failed even without model instance: {e2}")
                 return
         
         # Get panda_link7 body
@@ -668,16 +683,16 @@ panda_link7_extractor = builder.AddNamedSystem("PandaLink7PoseExtractor",
 
 # Debug: Check plant state output port size
 panda_state_port = plant.get_state_output_port(panda_id)
-print(f"Panda state output port size: {panda_state_port.size()}")
-print(f"Expected input port size: {num_robot_positions * 2}")
-print(f"Plant num_positions for panda: {plant.num_positions(panda_id)}")
-print(f"Plant num_velocities for panda: {plant.num_velocities(panda_id)}")
-print(f"Our num_robot_positions: {num_robot_positions}")
+# print(f"Panda state output port size: {panda_state_port.size()}")
+# print(f"Expected input port size: {num_robot_positions * 2}")
+# print(f"Plant num_positions for panda: {plant.num_positions(panda_id)}")
+# print(f"Plant num_velocities for panda: {plant.num_velocities(panda_id)}")
+# print(f"Our num_robot_positions: {num_robot_positions}")
 
 # Check if the input port size matches
 extractor_input_port = panda_link7_extractor.GetInputPort("joint_positions")
-print(f"Extractor input port size: {extractor_input_port.size()}")
-print(f"Port sizes match: {panda_state_port.size() == extractor_input_port.size()}")
+# print(f"Extractor input port size: {extractor_input_port.size()}")
+# print(f"Port sizes match: {panda_state_port.size() == extractor_input_port.size()}")
 
 # Connect robot joint states to PandaLink7PoseExtractor
 builder.Connect(plant.get_state_output_port(panda_id), 
@@ -710,9 +725,8 @@ class ContactDetectorForIntegrator(LeafSystem):
         # Check for contacts
         num_contacts = contact_results.num_point_pair_contacts()
         
-        if num_contacts == 0:
-            output.set_value([0.0])
-            return
+        # Get current time
+        t = context.get_time()
         
         # Get box body indices
         box_body_indices = []
@@ -721,19 +735,103 @@ class ContactDetectorForIntegrator(LeafSystem):
             if body.model_instance() == self.movable_box_id:
                 box_body_indices.append(body_idx)
         
-        # Get robot end-effector body indices - ONLY rubber pad
+        # Get robot end-effector body indices - rubber pad and panda_hand
         robot_body_indices = []
         
         # Find rubber pad
         try:
             body = self.plant.GetBodyByName("rubber_pad")
             robot_body_indices.append(body.index())
-            print(f"Found rubber_pad at body index {body.index()}")
+            # Only print once
+            if not hasattr(self, '_printed_rubber_pad'):
+                print(f"Found rubber_pad at body index {body.index()}")
+                self._printed_rubber_pad = True
         except:
-            print("Warning: rubber_pad not found in plant!")
-            pass
+            if not hasattr(self, '_printed_warning'):
+                print("Warning: rubber_pad not found in plant!")
+                self._printed_warning = True
         
-        # Check if any contact is between robot and box
+        # Find panda_hand
+        try:
+            body = self.plant.GetBodyByName("panda_hand")
+            robot_body_indices.append(body.index())
+            # Only print once
+            if not hasattr(self, '_printed_panda_hand'):
+                print(f"Found panda_hand at body index {body.index()}")
+                self._printed_panda_hand = True
+        except:
+            if not hasattr(self, '_printed_warning_hand'):
+                print("Warning: panda_hand not found in plant!")
+                self._printed_warning_hand = True
+        
+        # If neither found, print available bodies
+        if len(robot_body_indices) == 0 and not hasattr(self, '_printed_available_bodies'):
+            print("Available robot bodies:")
+            panda_id = self.plant.GetModelInstanceByName("panda")
+            for i in range(self.plant.num_bodies()):
+                body = self.plant.get_body(BodyIndex(i))
+                if body.model_instance() == panda_id:
+                    print(f"  - {body.name()} (index {i})")
+            self._printed_available_bodies = True
+        
+        # Log all contact information
+        for i in range(num_contacts):
+            contact_info = contact_results.point_pair_contact_info(i)
+            bodyA_idx = contact_info.bodyA_index()
+            bodyB_idx = contact_info.bodyB_index()
+            
+            bodyA_name = self.plant.get_body(BodyIndex(bodyA_idx)).name()
+            bodyB_name = self.plant.get_body(BodyIndex(bodyB_idx)).name()
+            
+            # Also get model instance for debugging
+            bodyA_model = self.plant.get_body(BodyIndex(bodyA_idx)).model_instance()
+            bodyB_model = self.plant.get_body(BodyIndex(bodyB_idx)).model_instance()
+            
+            # Determine contact type
+            is_robot_A = bodyA_idx in robot_body_indices
+            is_robot_B = bodyB_idx in robot_body_indices
+            is_box_A = bodyA_idx in box_body_indices
+            is_box_B = bodyB_idx in box_body_indices
+            
+            contact_type = "unknown"
+            if is_robot_A and is_robot_B:
+                contact_type = "robot-self"
+            elif is_box_A and is_box_B:
+                contact_type = "box-box"
+            elif (is_robot_A and is_box_B) or (is_robot_B and is_box_A):
+                contact_type = "robot-box"
+            else:
+                contact_type = "other"
+            
+            # Get contact force
+            force = contact_info.contact_force()
+            force_magnitude = np.linalg.norm([force[0], force[1], force[2]])
+            
+            # Log this contact
+            if not hasattr(self, '_contact_log'):
+                self._contact_log = []
+            
+            self._contact_log.append({
+                'time': t,
+                'bodyA': bodyA_name,
+                'bodyB': bodyB_name,
+                'bodyA_idx': bodyA_idx,
+                'bodyB_idx': bodyB_idx,
+                'bodyA_model': str(bodyA_model),
+                'bodyB_model': str(bodyB_model),
+                'type': contact_type,
+                'force_x': force[0],
+                'force_y': force[1],
+                'force_z': force[2],
+                'force_magnitude': force_magnitude
+            })
+        
+        if num_contacts == 0:
+            output.set_value([0.0])
+            return
+        
+        # Check if any contact is between robot (rubber_pad) and box ONLY
+        # Reject: self-contacts (robot-robot) and box-to-box contacts
         contact_detected = False
         for i in range(num_contacts):
             contact_info = contact_results.point_pair_contact_info(i)
@@ -746,6 +844,15 @@ class ContactDetectorForIntegrator(LeafSystem):
             is_box_A = bodyA_idx in box_body_indices
             is_box_B = bodyB_idx in box_body_indices
             
+            # Skip self-contacts (robot-robot)
+            if is_robot_A and is_robot_B:
+                continue
+            
+            # Skip box-to-box contacts
+            if is_box_A and is_box_B:
+                continue
+            
+            # Only accept robot (rubber_pad) contacting box
             if (is_robot_A and is_box_B) or (is_robot_B and is_box_A):
                 contact_detected = True
                 # Get body names for debugging
@@ -766,9 +873,9 @@ builder.Connect(plant.get_contact_results_output_port(),
 # Add Z-axis integrator system with two inputs
 z_integrator = builder.AddNamedSystem("ZAxisIntegrator", 
                                      make_integrate_z_two_in_block(
-                                         Ki_z=0.5,  # Integral gain for Z (reduced for stability)
+                                         Ki_z=2,  # Integral gain for Z (reduced for stability)
                                          z_min=-0.5,  # Minimum Z limit
-                                         z_max=0.5,   # Maximum Z limit
+                                         z_max=1,   # Maximum Z limit
                                          Kaw_z=0.1,   # Anti-windup gain
                                          error_mode="a_minus_b",  # a.z - b.z
                                          passthrough_xy_from="a",  # Use X,Y from first input
@@ -845,8 +952,13 @@ builder.Connect(box_position_extractor.GetOutputPort("box_position"),
 builder.Connect(contact_detector.GetOutputPort("contact"),
                z_integrator.GetInputPort("contact"))
 
-# Add logger for Z-axis integrator output
+# Connect z_integrator output to IK system (for z-adjusted target with integrated offset)
+builder.Connect(z_integrator.GetOutputPort("u"),
+               ik_box_tracker.GetInputPort("z_adjusted_target"))
+
+# Add loggers for Z-axis integrator output and contact flag
 logger_z_integrated = LogVectorOutput(z_integrator.GetOutputPort("u"), builder)
+logger_contact_flag = LogVectorOutput(contact_detector.GetOutputPort("contact"), builder)
 
 # Finalize the diagram
 diagram = builder.Build()
@@ -858,7 +970,7 @@ diagram_context = diagram.CreateDefaultContext()
 ####################################
 if simulate:
     simulator = Simulator(diagram, diagram_context)
-    print(f"Initial positions: {trajInit_}")
+    # print(f"Initial positions: {trajInit_}")
     plant.SetPositions(plant_context, panda_id, trajInit_)
     simulator.set_target_realtime_rate(realtime_factor)
     simulator.set_publish_every_time_step(True)
@@ -869,40 +981,67 @@ if simulate:
     sim_time = 10.0  # Fixed simulation time since no trajectory duration
     simulator_context = simulator.get_mutable_context()
 
-    print(f"Starting simulation for {sim_time} seconds...")
-    print(f"Initial` positions: {trajInit_}")
-    print("Using Relaxed IK to track box position!")
+    # print(f"Starting simulation for {sim_time} seconds...")
+    # print(f"Initial` positions: {trajInit_}")
+    # print("Using Relaxed IK to track box position!")
 
     # Run simulation
     while simulator_context.get_time() < sim_time:
          next_time = min(sim_time, simulator_context.get_time() + kStep)
          simulator.AdvanceTo(next_time)
 
-    print("Simulation completed!")
+    # print("Simulation completed!")
     
     # Evaluate and print the final pose of the movable box
 
     
     # Record and publish MeshCat visualization
     if meshcat_visualisation:
-        print("Recording simulation for MeshCat replay...")
+        # print("Recording simulation for MeshCat replay...")
         meshcat.StartRecording()
         simulator.AdvanceTo(sim_time)  # Adjust this time as needed
         meshcat.PublishRecording()
-        print("MeshCat recording published!")
+        # print("MeshCat recording published!")
         
         # Save HTML recording
         html_path = os.path.join(os.path.dirname(__file__), "meshcat_recording_erg.html")
         html_data = meshcat.StaticHtml()
-        print("Recording size (characters):", len(html_data))
+        # print("Recording size (characters):", len(html_data))
         
         if len(html_data) > 0:
             with open(html_path, "w") as f:
                 f.write(html_data)
-            print(f"Recording saved to: {html_path}")
+            # print(f"Recording saved to: {html_path}")
         else:
-            print("MeshCat recording appears to be empty. Did any geometry move?")
+            # print("MeshCat recording appears to be empty. Did any geometry move?")
+            pass
 
+# Save contact log to file
+if hasattr(contact_detector, '_contact_log') and len(contact_detector._contact_log) > 0:
+    contact_log_path = os.path.join(os.path.dirname(__file__), "contact_log.csv")
+    print(f"\nSaving contact log to: {contact_log_path}")
+    
+    import csv
+    with open(contact_log_path, 'w', newline='') as csvfile:
+        fieldnames = ['time', 'bodyA', 'bodyB', 'bodyA_idx', 'bodyB_idx', 'bodyA_model', 'bodyB_model', 'type', 'force_x', 'force_y', 'force_z', 'force_magnitude']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for contact in contact_detector._contact_log:
+            writer.writerow(contact)
+    
+    print(f"Saved {len(contact_detector._contact_log)} contact events")
+    
+    # Print summary
+    contact_types = {}
+    for contact in contact_detector._contact_log:
+        ct = contact['type']
+        contact_types[ct] = contact_types.get(ct, 0) + 1
+    
+    print("\nContact type summary:")
+    for ctype, count in contact_types.items():
+        print(f"  {ctype}: {count}")
+else:
+    print("\nNo contacts logged")
 
 # Assuming you have the following limits defined somewhere in your script
 limit_q_min = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
@@ -919,17 +1058,18 @@ log_energy = logger_energy.FindLog(diagram_context)
 log_contact_forces = logger_contact_forces.FindLog(diagram_context)
 log_panda_link7_world = logger_panda_link7_world.FindLog(diagram_context)
 log_z_integrated = logger_z_integrated.FindLog(diagram_context)
+log_contact_flag = logger_contact_flag.FindLog(diagram_context)
 
 t_time = log_x.sample_times()
 
 # Debug: Check plant state structure
-print(f"\n=== Plant State Structure Debug ===")
-print(f"Total plant state size: {log_x.data().shape}")
-print(f"Robot positions: {num_robot_positions}")
-print(f"Robot velocities: {num_robot_positions}")
-print(f"Box positions: {plant.num_positions(movable_box_id)}")
-print(f"Box velocities: {plant.num_velocities(movable_box_id)}")
-print(f"Expected total state size: {num_robot_positions * 2 + plant.num_positions(movable_box_id) + plant.num_velocities(movable_box_id)}")
+# print(f"\n=== Plant State Structure Debug ===")
+# print(f"Total plant state size: {log_x.data().shape}")
+# print(f"Robot positions: {num_robot_positions}")
+# print(f"Robot velocities: {num_robot_positions}")
+# print(f"Box positions: {plant.num_positions(movable_box_id)}")
+# print(f"Box velocities: {plant.num_velocities(movable_box_id)}")
+# print(f"Expected total state size: {num_robot_positions * 2 + plant.num_positions(movable_box_id) + plant.num_velocities(movable_box_id)}")
 
 # Extract only robot joint positions and velocities from the full plant state
 # Plant state structure: [robot_positions, robot_velocities, box_positions, box_velocities]
@@ -940,9 +1080,9 @@ robot_velocities_end = num_robot_positions * 2
 
 data_q = log_x.data().transpose()[:, robot_positions_start:robot_positions_end]  # Robot joint positions only
 data_qdot = log_x.data().transpose()[:, robot_velocities_start:robot_velocities_end]  # Robot joint velocities only
-print(f"Extracted data_q shape: {data_q.shape}")
-print(f"Extracted data_qdot shape: {data_qdot.shape}")
-print("=" * 50)
+# print(f"Extracted data_q shape: {data_q.shape}")
+# print(f"Extracted data_qdot shape: {data_qdot.shape}")
+# print("=" * 50)
 data_tau = log_tau.data().transpose()  # Selecting only the first 7 columns (joints)
 data_qv = log_qv.data().transpose()  # Selecting only the first 7 columns (joints)
 data_qr = log_qr.data().transpose()  # Selecting only the first 7 columns (joints)
@@ -951,52 +1091,61 @@ data_energy = log_energy.data().transpose() # system energy
 data_contact_forces = log_contact_forces.data().transpose() # contact forces
 data_panda_link7_world = log_panda_link7_world.data().transpose() # panda_link7 world positions
 data_z_integrated = log_z_integrated.data().transpose() # Z-axis integrator output
+data_contact_flag = log_contact_flag.data().transpose() # contact flag (1 when contact, 0 when no contact)
+
+# Debug: Print contact detection stats
+print(f"\n=== Contact Detection Debug ===")
+print(f"Contact flag shape: {data_contact_flag.shape}")
+print(f"Contact flag range: [{np.min(data_contact_flag):.2f}, {np.max(data_contact_flag):.2f}]")
+print(f"Fraction of time with contact: {np.sum(data_contact_flag > 0.5) / len(data_contact_flag) * 100:.1f}%")
+print(f"Integrated Z range: [{np.min(data_z_integrated[:, 2]):.4f}, {np.max(data_z_integrated[:, 2]):.4f}]")
+print("=" * 50)
 
 # Extract panda_link7 positions using the new PoseExtractor system
-print("Extracting panda_link7 positions using PandaLink7PoseExtractor...")
-print(f"Panda link7 world positions data shape: {data_panda_link7_world.shape}")
+# print("Extracting panda_link7 positions using PandaLink7PoseExtractor...")
+# print(f"Panda link7 world positions data shape: {data_panda_link7_world.shape}")
 
 # The new system directly gives us X, Y, Z positions
 # data_panda_link7_world shape: [time_steps, 3] where 3 = [X, Y, Z]
 panda_link7_positions = data_panda_link7_world
 
-print(f"panda_link7 positions shape: {panda_link7_positions.shape}")
-print(f"Sample panda_link7 positions: {panda_link7_positions[:5]}")
+# print(f"panda_link7 positions shape: {panda_link7_positions.shape}")
+# print(f"Sample panda_link7 positions: {panda_link7_positions[:5]}")
 
 # Print the last values of joint positions from logger data
-print(f"\n=== Final Joint Positions ===")
-print(f"Joint positions at end of simulation:")
-print(f"Final joint positions: {data_q[-1, :]}")
-print("=" * 30)
+# print(f"\n=== Final Joint Positions ===")
+# print(f"Joint positions at end of simulation:")
+# print(f"Final joint positions: {data_q[-1, :]}")
+# print("=" * 30)
 
 # Get body poses at the end of simulation using the last joint positions from logger
-print(f"\n=== Final Body Poses (using logged joint positions) ===")
+# print(f"\n=== Final Body Poses (using logged joint positions) ===")
 try:
     # Set the plant to the final joint positions from logger
     final_joint_positions = data_q[-1, :]
     
     # Debug: Check vector sizes
-    print(f"data_q shape: {data_q.shape}")
-    print(f"final_joint_positions length: {len(final_joint_positions)}")
-    print(f"Plant num_positions for panda: {plant.num_positions(panda_id)}")
-    print(f"Expected num_robot_positions: {num_robot_positions}")
-    print(f"final_joint_positions: {final_joint_positions}")
+    # print(f"data_q shape: {data_q.shape}")
+    # print(f"final_joint_positions length: {len(final_joint_positions)}")
+    # print(f"Plant num_positions for panda: {plant.num_positions(panda_id)}")
+    # print(f"Expected num_robot_positions: {num_robot_positions}")
+    # print(f"final_joint_positions: {final_joint_positions}")
     
     # Ensure we have the right number of positions
     if len(final_joint_positions) != plant.num_positions(panda_id):
-        print(f"Warning: Position vector length mismatch!")
-        print(f"  Logger data length: {len(final_joint_positions)}")
-        print(f"  Plant expects: {plant.num_positions(panda_id)}")
+        # print(f"Warning: Position vector length mismatch!")
+        # print(f"  Logger data length: {len(final_joint_positions)}")
+        # print(f"  Plant expects: {plant.num_positions(panda_id)}")
         
         # Truncate or pad as needed
         if len(final_joint_positions) > plant.num_positions(panda_id):
             final_joint_positions = final_joint_positions[:plant.num_positions(panda_id)]
-            print(f"  Truncated to: {final_joint_positions}")
+            # print(f"  Truncated to: {final_joint_positions}")
         else:
             # Pad with zeros
             padding = [0.0] * (plant.num_positions(panda_id) - len(final_joint_positions))
             final_joint_positions = np.concatenate([final_joint_positions, padding])
-            print(f"  Padded to: {final_joint_positions}")
+            # print(f"  Padded to: {final_joint_positions}")
     
     plant.SetPositions(plant_context, panda_id, final_joint_positions)
     
@@ -1010,12 +1159,13 @@ try:
     panda_hand_pose = plant.EvalBodyPoseInWorld(plant_context, panda_hand_body)
     panda_hand_translation = panda_hand_pose.translation()
     
-    print(f"panda_link7 translation: {panda_link7_translation}")
-    print(f"panda_hand translation: {panda_hand_translation}")
-    print("=" * 30)
+    # print(f"panda_link7 translation: {panda_link7_translation}")
+    # print(f"panda_hand translation: {panda_hand_translation}")
+    # print("=" * 30)
     
 except Exception as e:
-    print(f"Error getting final body poses: {e}")
+    # print(f"Error getting final body poses: {e}")
+    pass
 
 # Create a figure for panda_link7 world positions
 fig_panda_link7, axs_panda_link7 = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
@@ -1040,13 +1190,13 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
 # Print summary statistics for panda_link7 positions
-print("\n=== Panda Link7 Position Summary (Direct Pose Extraction) ===")
-print(f"Initial position: [{panda_link7_positions[0, 0]:.4f}, {panda_link7_positions[0, 1]:.4f}, {panda_link7_positions[0, 2]:.4f}] m")
-print(f"Final position: [{panda_link7_positions[-1, 0]:.4f}, {panda_link7_positions[-1, 1]:.4f}, {panda_link7_positions[-1, 2]:.4f}] m")
-print(f"Total displacement: {np.linalg.norm(panda_link7_positions[-1] - panda_link7_positions[0]):.4f} m")
-print(f"X range: [{np.min(panda_link7_positions[:, 0]):.4f}, {np.max(panda_link7_positions[:, 0]):.4f}] m")
-print(f"Y range: [{np.min(panda_link7_positions[:, 1]):.4f}, {np.max(panda_link7_positions[:, 1]):.4f}] m")
-print(f"Z range: [{np.min(panda_link7_positions[:, 2]):.4f}, {np.max(panda_link7_positions[:, 2]):.4f}] m")
+# print("\n=== Panda Link7 Position Summary (Direct Pose Extraction) ===")
+# print(f"Initial position: [{panda_link7_positions[0, 0]:.4f}, {panda_link7_positions[0, 1]:.4f}, {panda_link7_positions[0, 2]:.4f}] m")
+# print(f"Final position: [{panda_link7_positions[-1, 0]:.4f}, {panda_link7_positions[-1, 1]:.4f}, {panda_link7_positions[-1, 2]:.4f}] m")
+# print(f"Total displacement: {np.linalg.norm(panda_link7_positions[-1] - panda_link7_positions[0]):.4f} m")
+# print(f"X range: [{np.min(panda_link7_positions[:, 0]):.4f}, {np.max(panda_link7_positions[:, 0]):.4f}] m")
+# print(f"Y range: [{np.min(panda_link7_positions[:, 1]):.4f}, {np.max(panda_link7_positions[:, 1]):.4f}] m")
+# print(f"Z range: [{np.min(panda_link7_positions[:, 2]):.4f}, {np.max(panda_link7_positions[:, 2]):.4f}] m")
 
 # Identify modified joints (comparing with initial configuration)
 modified_indices = np.where(trajInit_ != 0)[0]  # Find non-zero initial positions
@@ -1259,57 +1409,67 @@ else:
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
-# Create a figure for Z-axis integrator output
-fig_z_integrator, axs_z_integrator = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_z_integrator.suptitle('Z-Axis Integrator Output (XYZ)')
+# Create a figure for Z-axis integrator output (only Z, with contact detection markers)
+fig_z_integrator, ax_z = plt.subplots(1, 1, figsize=(12, 6))
+fig_z_integrator.suptitle('Z-Axis Integrator Output (Only Integrated Z)')
 
-# Plot Z-axis integrator output (assuming first 3 components are x, y, z)
+# Plot Z-axis integrator output (only Z component)
 if data_z_integrated.shape[1] >= 3:
-    axs_z_integrator[0].plot(t_time, data_z_integrated[:, 0], label='Integrated X', linestyle='-', color='red')
-    axs_z_integrator[1].plot(t_time, data_z_integrated[:, 1], label='Integrated Y', linestyle='-', color='green')
-    axs_z_integrator[2].plot(t_time, data_z_integrated[:, 2], label='Integrated Z', linestyle='-', color='blue')
+    ax_z.plot(t_time, data_z_integrated[:, 2], label='Integrated Z', linestyle='-', color='blue', linewidth=2)
     
-    axs_z_integrator[0].set_ylabel('Integrated X [m]')
-    axs_z_integrator[1].set_ylabel('Integrated Y [m]')
-    axs_z_integrator[2].set_ylabel('Integrated Z [m]')
+    # Find when contact transitions from 0 to 1
+    contact_values = data_contact_flag.flatten()
+    contact_transitions = []
+    for i in range(1, len(contact_values)):
+        # Check if contact just became active (0 -> 1)
+        if contact_values[i] > 0.5 and contact_values[i-1] <= 0.5:
+            contact_transitions.append(t_time[i])
     
-    for ax in axs_z_integrator:
-        ax.grid(True)
-        ax.legend(loc='upper right')
-        ax.set_xlim([t_time[1], t_time[-1]])
+    # Add vertical lines at contact detection points
+    for transition_time in contact_transitions:
+        ax_z.axvline(x=transition_time, color='red', linestyle='--', linewidth=1.5, 
+                     label='Contact detected' if transition_time == contact_transitions[0] else '')
     
-    axs_z_integrator[2].set_xlabel('Time [s]')
+    ax_z.set_ylabel('Integrated Z [m]')
+    ax_z.set_xlabel('Time [s]')
+    ax_z.grid(True)
+    ax_z.legend(loc='upper right')
+    ax_z.set_xlim([t_time[1], t_time[-1]])
+    
+    print(f"\nContact detected at times: {contact_transitions}")
 else:
-    # If Z-axis integrator data structure is different, plot all available components
-    for i in range(min(3, data_z_integrated.shape[1])):
-        axs_z_integrator[i].plot(t_time, data_z_integrated[:, i], label=f'Integrated {i+1}', linestyle='-')
-        axs_z_integrator[i].set_ylabel(f'Integrated {i+1} [m]')
-        axs_z_integrator[i].grid(True)
-        axs_z_integrator[i].legend(loc='upper right')
-        axs_z_integrator[i].set_xlim([t_time[1], t_time[-1]])
-    
-    axs_z_integrator[2].set_xlabel('Time [s]')
+    # If Z-axis integrator data structure is different, plot the last component
+    ax_z.plot(t_time, data_z_integrated[:, -1], label='Integrated Z', linestyle='-', color='blue', linewidth=2)
+    ax_z.set_ylabel('Integrated Z [m]')
+    ax_z.set_xlabel('Time [s]')
+    ax_z.grid(True)
+    ax_z.legend(loc='upper right')
+    ax_z.set_xlim([t_time[1], t_time[-1]])
 
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.show()
 
-# Print summary statistics for energy and contact forces
-print("\n=== Energy and Contact Forces Summary ===")
-print(f"Final total energy: {data_energy[-1, 0]:.4f} J")
-if data_energy.shape[1] > 1:
-    print(f"Final kinetic energy: {data_energy[-1, 1]:.4f} J")
-    print(f"Final potential energy: {data_energy[-1, 2]:.4f} J")
+# Keep plots open
+print("\nPlots displayed. Close windows or press Enter to continue...")
+input()
 
-print(f"Max contact force magnitude: {np.max(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
-print(f"Average contact force magnitude: {np.mean(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
+# Print summary statistics for energy and contact forces
+# print("\n=== Energy and Contact Forces Summary ===")
+# print(f"Final total energy: {data_energy[-1, 0]:.4f} J")
+# if data_energy.shape[1] > 1:
+#     print(f"Final kinetic energy: {data_energy[-1, 1]:.4f} J")
+#     print(f"Final potential energy: {data_energy[-1, 2]:.4f} J")
+
+# print(f"Max contact force magnitude: {np.max(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
+# print(f"Average contact force magnitude: {np.mean(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
 
 # Print summary statistics for Z-axis integrator
-print("\n=== Z-Axis Integrator Summary ===")
-if data_z_integrated.shape[1] >= 3:
-    print(f"Final integrated position: [{data_z_integrated[-1, 0]:.4f}, {data_z_integrated[-1, 1]:.4f}, {data_z_integrated[-1, 2]:.4f}] m")
-    print(f"X range: [{np.min(data_z_integrated[:, 0]):.4f}, {np.max(data_z_integrated[:, 0]):.4f}] m")
-    print(f"Y range: [{np.min(data_z_integrated[:, 1]):.4f}, {np.max(data_z_integrated[:, 1]):.4f}] m")
-    print(f"Z range: [{np.min(data_z_integrated[:, 2]):.4f}, {np.max(data_z_integrated[:, 2]):.4f}] m")
-else:
-    print(f"Z-axis integrator output shape: {data_z_integrated.shape}")
-    print(f"Final integrated values: {data_z_integrated[-1, :]}")
+# print("\n=== Z-Axis Integrator Summary ===")
+# if data_z_integrated.shape[1] >= 3:
+#     print(f"Final integrated position: [{data_z_integrated[-1, 0]:.4f}, {data_z_integrated[-1, 1]:.4f}, {data_z_integrated[-1, 2]:.4f}] m")
+#     print(f"X range: [{np.min(data_z_integrated[:, 0]):.4f}, {np.max(data_z_integrated[:, 0]):.4f}] m")
+#     print(f"Y range: [{np.min(data_z_integrated[:, 1]):.4f}, {np.max(data_z_integrated[:, 1]):.4f}] m")
+#     print(f"Z range: [{np.min(data_z_integrated[:, 2]):.4f}, {np.max(data_z_integrated[:, 2]):.4f}] m")
+# else:
+#     print(f"Z-axis integrator output shape: {data_z_integrated.shape}")
+#     print(f"Final integrated values: {data_z_integrated[-1, :]}")
