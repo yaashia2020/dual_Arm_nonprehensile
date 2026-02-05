@@ -2,6 +2,12 @@ import time
 from pydrake.all import *
 import os
 import numpy as np
+from CERG_Setup import (
+    PredictionParams,
+    ErgParams,
+    ContactParams,
+    RobotSpec,
+)
 
 # Import FCL for collision detection in predictions
 try:
@@ -16,75 +22,68 @@ except ImportError:
 ####################################
 #     Create system diagram
 ####################################
-def create_system_model(plant, scene_graph):
+def create_system_model(plant, scene_graph, robot_spec: RobotSpec, contact_params: ContactParams = None):
     """
     Add the Panda arm model and movable box to the plant and configure contact properties.
     
     Args:
         plant: The MultibodyPlant object to which the Panda arm model will be added.
         scene_graph: The SceneGraph object for visualization.
+        robot_spec: RobotSpec describing the robot URDF and limits (required).
+        contact_params: Optional ContactParams; if None, uses Drake hydroelastic defaults used elsewhere.
     
     Returns:
         Tuple containing the updated plant and scene_graph.
     """
-    urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
-    urdf = "file://" + urdf_path
-    arm = Parser(plant).AddModelsFromUrl(urdf)
-    contact_model = ContactModel.kHydroelasticWithFallback  # Options: Hydroelastic, Point, or HydroelasticWithFallback
-    discrete_solver = DiscreteContactApproximation.kSap # Options:kTamsi, kSap, kLagged, kSimilar
-    mesh_type = HydroelasticContactRepresentation.kTriangle  # Options: Triangle or Polygon    
-    plant.set_contact_surface_representation(mesh_type)
-    plant.set_contact_model(contact_model)
-    plant.set_discrete_contact_approximation(discrete_solver)
+    if contact_params is None:
+        contact_params = ContactParams()
+
+    urdf = "file://" + robot_spec.urdf_path
+    Parser(plant).AddModelsFromUrl(urdf)
+    plant.set_contact_surface_representation(contact_params.mesh_type)
+    plant.set_contact_model(contact_params.contact_model)
+    plant.set_discrete_contact_approximation(contact_params.discrete_solver)
     plant.Finalize()
     return plant, scene_graph
 
 ######################################################################################################
 #                         #########  explicit_reference_governor  ##########                       #
 ######################################################################################################
-class ExplicitReferenceGovernor:
-    def __init__(self, robust_delta_tau_, kappa_tau_, 
-                 robust_delta_q_, kappa_q_, robust_delta_dq_, kappa_dq_, 
-                 robust_delta_dp_EE_, kappa_dp_EE_, kappa_terminal_energy_, FD_=1.0, 
-                 num_joints=7, urdf_path=None):
+class CompliantERG:
+    def __init__(self, 
+                 robot_spec: RobotSpec,
+                 prediction_params: PredictionParams = PredictionParams(),
+                 erg_params: ErgParams = ErgParams(),
+                 contact_params: ContactParams = ContactParams()):
         """
         Initialize the Explicit Reference Governor (ERG) with given parameters.
         
         Args:
-            robust_delta_tau_ (float): Robustness parameter for joint torques.
-            kappa_tau_ (float): Scaling parameter for joint torques.
-            robust_delta_q_ (float): Robustness parameter for joint positions.
-            kappa_q_ (float): Scaling parameter for joint positions.
-            robust_delta_dq_ (float): Robustness parameter for joint velocities.
-            kappa_dq_ (float): Scaling parameter for joint velocities.
-            robust_delta_dp_EE_ (float): Robustness parameter for end-effector velocities.
-            kappa_dp_EE_ (float): Scaling parameter for end-effector velocities.
-            kappa_terminal_energy_ (float): Scaling parameter for terminal energy.
-            FD_ (float): Force damping parameter for soft navigation field.
-            num_joints (int): Number of robot joints (default: 7 for Panda).
-            urdf_path (str): Path to URDF file (optional, uses default Panda if None).
+            robot_spec (RobotSpec): Robot specification (URDF path, gains, limits).
+            prediction_params (PredictionParams): Prediction timing parameters.
+            erg_params (ErgParams): ERG/DSM parameters.
+            contact_params (ContactParams): Drake contact settings.
         """
-        # Store num_joints parameter
-        self.num_joints = num_joints
-        
+        # Parameter containers
+        self.erg_params = erg_params
+        self.prediction_params = prediction_params
+        self.contact_params = contact_params
+
+        self.robot_spec = robot_spec
+        self.num_joints = robot_spec.controlled_dofs
+        self.controlled_indices = robot_spec.controlled_indices
+
         # Plant Configuration parameters
-        time_step = 0.01
-        # PLant for simulation
+        time_step = self.prediction_params.dt
         self.builder_pred = DiagramBuilder()
         self.plant_pred, scene_graph= AddMultibodyPlantSceneGraph(self.builder_pred, time_step)
         
-        # Use provided URDF path or default Panda URDF
-        if urdf_path is None:
-            urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
-        
-        urdf = "file://" + urdf_path
+        # Use URDF from robot spec
+        urdf = "file://" + robot_spec.urdf_path
         arm = Parser(self.plant_pred).AddModelsFromUrl(urdf)
-        contact_model = ContactModel.kHydroelasticWithFallback
-        discrete_solver = DiscreteContactApproximation.kSap
-        mesh_type = HydroelasticContactRepresentation.kTriangle
-        self.plant_pred.set_contact_surface_representation(mesh_type)
-        self.plant_pred.set_contact_model(contact_model)
-        self.plant_pred.set_discrete_contact_approximation(discrete_solver)
+        self.plant_pred.set_contact_surface_representation(self.contact_params.mesh_type)
+        self.plant_pred.set_contact_model(self.contact_params.contact_model)
+        self.plant_pred.set_discrete_contact_approximation(self.contact_params.discrete_solver)
         self.plant_pred.Finalize() 
 
         # Debug: Print plant information
@@ -97,44 +96,27 @@ class ExplicitReferenceGovernor:
         self.diagram_context = self.diagram.CreateDefaultContext()    
         self.plant_context =  self.diagram.GetMutableSubsystemContext(self.plant_pred, self.diagram_context)
                 
-        self.eta_ = 0.005 
-        self.zeta_q_ = 0.15 # range of influence for the repulsion field. 
-        self.delta_q_ = 0.1 # threshold for when the repulsion effect starts to take place.
-        self.dt_ = 0.01  # Sampling time for the refrence governor
+        self.eta_ = self.erg_params.eta 
+        self.zeta_q_ = self.erg_params.zeta_q # range of influence for the repulsion field. 
+        self.delta_q_ = self.erg_params.delta_q # threshold for when the repulsion effect starts to take place.
+        self.dt_ = self.erg_params.dt  # Sampling time for the reference governor
 
-        # Controller gains - dynamic based on num_joints
-        if num_joints == 7:
-            # Panda robot gains
-            self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0]
-            self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0]
-        elif num_joints == 9:
-            # Extended robot gains (7 original + 2 additional)
-            self.Kp_ = [120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0, 10.0, 10.0]
-            self.Kd_ = [8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0, 1.0, 1.0]
-        else:
-            # Generic gains for other joint counts
-            self.Kp_ = [100.0] * num_joints
-            self.Kd_ = [5.0] * num_joints
+        # Controller gains - derived from robot specification
+        self.Kp_ = np.array(robot_spec.kp, dtype=float)
+        self.Kd_ = np.array(robot_spec.kd, dtype=float)
 
         # Prediction parameters
-        prediction_dt_ = time_step# 0.01  # Time step for predictions
-        prediction_horizon_ = 0.2  # Total prediction horizon
-        self.num_pred_samples_ = int(prediction_horizon_ / prediction_dt_)
-
-        # Robustness and scaling parameters
-        self.robust_delta_tau_ = robust_delta_tau_
-        self.kappa_tau_ = kappa_tau_
-        self.robust_delta_q_ = robust_delta_q_
-        self.kappa_q_ = kappa_q_
-        self.robust_delta_dq_ = robust_delta_dq_
-        self.kappa_dq_ = kappa_dq_
-        self.robust_delta_dp_EE_ = robust_delta_dp_EE_
-        self.kappa_dp_EE_ = kappa_dp_EE_
-        self.kappa_terminal_energy_ = kappa_terminal_energy_
-        self.FD_ = FD_  # Force damping parameter
+        prediction_dt_ = self.prediction_params.dt
+        prediction_horizon_ = self.prediction_params.horizon
+        self.num_pred_samples_ = self.prediction_params.num_steps()
 
         self.num_positions =  self.plant_pred.num_positions()
         self.num_velocities = self.plant_pred.num_velocities()
+        # Cache prediction integration step (driven by PredictionParams in CERG_Setup)
+        self.prediction_dt_ = float(self.prediction_params.dt)
+        # Cache control mapping (driven by RobotSpec in CERG_Setup)
+        self.u_idx_ = np.array(self.controlled_indices, dtype=int).reshape(-1)
+        self.nu_ = int(self.plant_pred.get_actuation_input_port().size())
 
         # Initialize FCL collision detection if available
         self.fcl_available = FCL_AVAILABLE
@@ -158,33 +140,21 @@ class ExplicitReferenceGovernor:
         self.dq_pred_list_ = np.zeros((self.num_velocities, self.num_pred_samples_ + 1))
         self.tau_pred_list_ = np.zeros((self.plant_pred.get_actuation_input_port().size(), self.num_pred_samples_ + 1))
         
-        # Arrays to store body poses (translation part) for each prediction step
-        # Store poses for 7 links (panda_link1..panda_link7) PLUS panda_hand PLUS 2 fingers for each prediction step
-        # Shape: (10 tracked bodies, 3 coordinates (X,Y,Z), prediction steps)
-        # Order: panda_link1-7, panda_hand, panda_leftfinger, panda_rightfinger
-        self.body_pose_list_ = np.zeros((10, 3, self.num_pred_samples_ + 1))
+        # Tracked bodies come from robot_spec; store poses for each prediction step
+        self.tracked_bodies = list(robot_spec.tracked_bodies)
+        B = len(self.tracked_bodies)
+        self.body_pose_list_ = np.zeros((B, 3, self.num_pred_samples_ + 1))
         
-        # Limits for joint angles, velocities, and torques - dynamic based on num_joints
-        if num_joints == 7:
-            # Panda robot limits
-            self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
-            self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
-            self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
-            self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
-        elif num_joints == 9:
-            # Extended robot limits (7 original + 2 additional)
-            self.limit_q_min_ = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973, -3.14, -3.14])
-            self.limit_q_max_ = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973, 3.14, 3.14])
-            self.limit_tau_ = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0, 10.0, 10.0])
-            self.limit_dq_ = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100, 2.0, 2.0])
-        else:
-            # Generic limits for other joint counts
-            self.limit_q_min_ = np.array([-3.14] * num_joints)
-            self.limit_q_max_ = np.array([3.14] * num_joints)
-            self.limit_tau_ = np.array([50.0] * num_joints)
-            self.limit_dq_ = np.array([2.0] * num_joints)
-        self.limit_dp_EE_ = [1.7, 2.5]  # Translation and rotation limits for the end effector
-        self.E_max_ = 5.0  # Maximum energy limit
+        # Limits for joint angles, velocities, torques, EE velocities - driven by robot spec
+        self.limit_q_min_ = np.array(robot_spec.q_min, dtype=float)
+        self.limit_q_max_ = np.array(robot_spec.q_max, dtype=float)
+        self.limit_tau_ = np.array(robot_spec.tau_max, dtype=float)
+        self.limit_dq_ = np.array(robot_spec.dq_max, dtype=float)
+        self.limit_dp_EE_ = [robot_spec.limit_dp_trans, robot_spec.limit_dp_rot]  # Translation and rotation limits for the end effector
+        self.E_max_ = self.erg_params.E_max  # Maximum energy limit
+
+        # Latest DSM (for logging/plotting)
+        self.last_dsm = None
 
     def _build_fcl_collision_objects(self):
         """
@@ -278,6 +248,21 @@ class ExplicitReferenceGovernor:
             T_WC = T_WL @ T_LC
             obj.setTransform(self.fcl.Transform(T_WC[:3, :3], T_WC[:3, 3]))
 
+    def _tracked_body_positions_world(self) -> np.ndarray:
+        """
+        Return a (3, B) array of world-frame xyz positions for `self.tracked_bodies`.
+        Uses `self.plant_context` / `self.plant_pred` (caller must have already set positions in context).
+        """
+        B = len(self.tracked_bodies)
+        plant_positions = np.zeros((3, B), dtype=float)
+        for idx, body_name in enumerate(self.tracked_bodies):
+            try:
+                body = self.plant_pred.GetBodyByName(body_name)
+                plant_positions[:, idx] = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
+            except Exception:
+                plant_positions[:, idx] = 0.0
+        return plant_positions
+
     def get_qv(self, q, dq, tau, q_r, q_v, box_position=None):
         """
         Compute the new reference joint positions using the navigation field and DSM.
@@ -298,14 +283,15 @@ class ExplicitReferenceGovernor:
         
         rho_ = self.navigationField(q_r, q_v, box_position)
         DSM_ = self.trajectoryBasedDSM(q, dq, tau, q_v, box_position)
+        # Store for downstream logging/plotting
+        try:
+            self.last_dsm = float(DSM_)
+        except Exception:
+            self.last_dsm = None
 
         q_v_new = q_v + DSM_ * rho_ * self.dt_ 
         
-        # if DSM_ > 0:
-        #   q_v_new = q_v + DSM_ * rho_ * self.dt_ 
-        # else:
-        #   q_v_new = q_v + np.min([np.linalg.norm(DSM_ * rho_ * self.dt_), np.linalg.norm(q_r - q_v)]) * DSM_ * rho_ / max(np.linalg.norm(DSM_ * rho_), self.eta_)
-        
+     
         return q_v_new
 
     def get_energy(self, q, dq, tau, q_r, q_v, box_position=None):
@@ -362,9 +348,9 @@ class ExplicitReferenceGovernor:
         Compute soft navigation field based on box position constraint.
 
         """
-        # Define parameters (you can adjust these)
-        delta_s = 0.1  # Safety distance
-        eta_ = 0.005  # Small value to avoid division by zero
+        # Parameters from ERG settings
+        delta_s = self.erg_params.soft_delta_s  # Safety distance
+        eta_ = self.erg_params.soft_eta  # Small value to avoid division by zero
         
         # Define constraint vector
         c = np.array([-1.0, 0.0, 0.0])  # Vector c = [-1, 0, 0]
@@ -495,14 +481,19 @@ class ExplicitReferenceGovernor:
             dot_product_scalar = float(dot_product)
             kp_scalar = float(self.Kp_[i-1])  # Safe to access since we only go up to num_joints
             delta_s_scalar = float(delta_s)
-            fd_scalar = float(self.FD_)
-            
+            fd_scalar = float(self.erg_params.FD)
+            if w_scalar + dot_product_scalar < -1e-12:
+                breakpoint()
             scale_value = -kp_scalar * ((w_scalar + dot_product_scalar) / (delta_s_scalar * fd_scalar))
             scale = max(scale_value, 0.0)  # Ensure scalar result
             
             # Add to soft repulsion vector
             soft_rep[:self.num_joints] += scale * normalized_q_dots[i-1][:self.num_joints]  # Apply to all joints
         
+        # Debug: trigger a breakpoint if the soft repulsion activates (non-zero).
+        # if np.any(np.abs(soft_rep) > 1e-12):
+        #     breakpoint()
+
         return soft_rep
 
     def trajectoryBasedDSM(self, q, dq, tau, q_v, box_position):
@@ -519,6 +510,9 @@ class ExplicitReferenceGovernor:
       DSM_dq_ = self.dsmDq()
       DSM_dp_EE_ = self.dsmDpEE()
       DSM_s_ = self.dsmS(box_position)
+      # Debug: trigger a breakpoint if the distance-based DSM goes negative.
+      if DSM_s_ < -1e-12:
+          breakpoint()
       DSM_energy_ = self.dsmEnergy(total_energy, box_position, DSM_s_)
 
       # Find the minimum among the DSMs
@@ -549,9 +543,16 @@ class ExplicitReferenceGovernor:
             q_v: Reference joint positions
             box_position: Box position [x, y, z] for collision detection
         """
-        q_pred, dq_pred = state[:self.num_joints], state[self.num_joints:]
-        tau_pred = tau
+        # Cache sizes once (avoid repeating self.num_positions everywhere).
+        nq = self.num_positions
+        nv = self.num_velocities
+        u_idx = self.u_idx_
 
+        # State is expected as [q (nq), dq (nv)].
+        q_pred = np.asarray(state[:nq], dtype=float).copy()
+        dq_pred = np.asarray(state[nq : nq + nv], dtype=float).copy()
+        # tau is the *current* actuation coming from the plant; store it as the k=0 sample.
+        tau_pred = np.asarray(tau, dtype=float).reshape(-1)
         # Calculate energy at the beginning of trajectory prediction
         # Energy = InertiaMatrix*joint_velocity^2 + Kp_gains*(q_v-q)^2
         try:
@@ -560,19 +561,16 @@ class ExplicitReferenceGovernor:
             discrete_values = state.get_mutable_discrete_state()
             xd = discrete_values.get_mutable_vector()
             xd.SetFromVector(np.concatenate([q_pred, dq_pred]))
-            
             # Get the mass matrix (inertia matrix) for the current configuration
-            mass_matrix = self.plant_pred.CalcMassMatrix(self.plant_context)\
-            
+            mass_matrix = self.plant_pred.CalcMassMatrix(self.plant_context)
             # Kinetic energy: 0.5 * dq^T * M * dq
             kinetic_energy = 0.5 * dq_pred.T @ mass_matrix @ dq_pred
-            
             # Potential energy: 0.5 * position_error^T * Kp_diagonal_matrix * position_error
-            # Use joints based on num_joints
-            position_error = q_v[:self.num_joints] - q_pred[:self.num_joints]
-            Kp_diag_matrix = np.diag(self.Kp_)  # Create diagonal matrix from Kp gains
+            # Potential energy term uses only the controlled joints (RobotSpec.controlled_indices)
+            Kp_ = np.asarray(self.Kp_, dtype=float).reshape(-1)
+            position_error = q_v[u_idx] - q_pred[u_idx]
+            Kp_diag_matrix = np.diag(Kp_)  # Create diagonal matrix from Kp gains (controlled joints only)
             potential_energy = 0.5 * position_error.T @ Kp_diag_matrix @ position_error
-            
             # Total energy
             total_energy = kinetic_energy + potential_energy
             
@@ -584,69 +582,35 @@ class ExplicitReferenceGovernor:
         q_pred_traj = [q_pred.copy()]
         dq_pred_traj = [dq_pred.copy()]
         tau_pred_traj = [tau_pred.copy()]
-        
-        
-
         # Initialize lists to store predicted states
         self.q_pred_list_[:, 0] = q_pred
         self.dq_pred_list_[:, 0] = dq_pred
-        self.tau_pred_list_[:, 0] = tau_pred
-        
+        # Store initial torque sample in actuation space (best-effort truncate/pad).
+        # Be defensive: some Drake vector types can lead to non-int dtypes in shape/min.
+        tau0 = np.zeros(self.tau_pred_list_.shape[0], dtype=float)
+        n0 = int(min(int(tau0.shape[0]), int(np.asarray(tau_pred).shape[0])))
+        tau0[:n0] = np.asarray(tau_pred, dtype=float).reshape(-1)[:n0]
+        self.tau_pred_list_[:, 0] = tau0
         # Calculate and store initial body pose
         try:
             # Set plant to initial q_pred
-            self.plant_pred.SetPositions(self.plant_context, q_pred)  # Remove model_instance parameter
-            
-            # Define link range (similar to C++ code)
-            init_link_id = 1  # Start from panda_link1
-            final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 3  # 7 links + panda_hand + 2 fingers
-            
-            # Initialize plant_positions matrix (3 x s)
-            plant_positions = np.zeros((3, s))
-            
-            # Calculate poses for all joints from init_link_id to final_link_id
-            for j in range(init_link_id, final_link_id + 1):
-                body_name = f"panda_link{j}"
-                body = self.plant_pred.GetBodyByName(body_name)
-                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                plant_positions[:, j - init_link_id] = plant_joint_position
-
-            # Also include panda_hand as the 8th tracked body
-            try:
-                hand_body = self.plant_pred.GetBodyByName("panda_hand")
-                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
-                plant_positions[:, 7] = hand_pos
-            except Exception:
-                plant_positions[:, 7] = 0.0
-            
-            # Include panda fingers as the 9th and 10th tracked bodies
-            try:
-                leftfinger_body = self.plant_pred.GetBodyByName("panda_leftfinger")
-                leftfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, leftfinger_body).translation()
-                plant_positions[:, 8] = leftfinger_pos
-            except Exception:
-                plant_positions[:, 8] = 0.0
-                
-            try:
-                rightfinger_body = self.plant_pred.GetBodyByName("panda_rightfinger")
-                rightfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, rightfinger_body).translation()
-                plant_positions[:, 9] = rightfinger_pos
-            except Exception:
-                plant_positions[:, 9] = 0.0
-            
-            # Store all link poses (7 links + hand + 2 fingers) in body_pose_list_
-            for link_idx in range(10):
+            self.plant_pred.SetPositions(self.plant_context, q_pred)
+            plant_positions = self._tracked_body_positions_world()  # (3, B)
+            # Store all tracked body poses in body_pose_list_ (shape: (B, 3, ...))
+            for link_idx in range(len(self.tracked_bodies)):
                 self.body_pose_list_[link_idx, :, 0] = plant_positions[:, link_idx]
-                
         except Exception as e:
             print(f"Initial body pose calculation failed: {e}")
             self.body_pose_list_[:, :, 0] = 0.0
 
+        # Cache arrays for rollout; avoid mutating self.* inside the loop.
+        Kp_ = np.asarray(self.Kp_, dtype=float).reshape(-1)
+        Kd_ = np.asarray(self.Kd_, dtype=float).reshape(-1)
+
         for k in range(self.num_pred_samples_):
         
 
-            gravity_pred = - self.plant_pred.CalcGravityGeneralizedForces(self.plant_context) # Compute gravity_pred for the current state
+            gravity_pred = -self.plant_pred.CalcGravityGeneralizedForces(self.plant_context)  # PD+G convention
             
 
             # print("Shapes inside trajectoryPredictions:")
@@ -654,24 +618,19 @@ class ExplicitReferenceGovernor:
             # print("q_pred shape:", q_pred.shape) 
             # print("dq_pred shape:", dq_pred.shape)
             # print("gravity_pred shape:", gravity_pred.shape)
-            # import numpy as np
-            self.Kp_ = np.array(self.Kp_)
-            self.Kd_ = np.array(self.Kd_)
-
-
-            # Compute tau_pred
-            tau_pred_partial = self.Kp_ * (q_v[:self.num_joints] - q_pred[:self.num_joints]) - self.Kd_ * dq_pred[:self.num_joints] + gravity_pred[:self.num_joints]
-            tau_pred = np.zeros(self.num_positions)
-            tau_pred[:self.num_joints] = tau_pred_partial
-            tau_pred[self.num_joints:] = 0  # Zero torque for extra joints
-
-
-
+            # Compute torques for controlled joints only, then expand to full generalized dimension.
+            tau_u = Kp_ * (q_v[u_idx] - q_pred[u_idx]) - Kd_ * dq_pred[u_idx] + np.asarray(gravity_pred, dtype=float).reshape(-1)[u_idx]
+            tau_pred = np.zeros(nq, dtype=float)
+            tau_pred[u_idx] = tau_u
             # Solve for x[k+1] using the computed tau_pred
             
-            state_pred, body_pose_translation = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
-            q_pred = state_pred[:self.num_positions]
-            dq_pred = state_pred[self.num_positions:]
+            state_pred, body_pose_translation = self.calc_dynamics(
+                np.concatenate((q_pred, dq_pred)),
+                tau_pred,
+                q_v,
+            )
+            q_pred = state_pred[:nq]
+            dq_pred = state_pred[nq:]
 
             # Store predicted states
             q_pred_traj.append(q_pred.copy())
@@ -682,12 +641,15 @@ class ExplicitReferenceGovernor:
             # Add q, dq, and tau to prediction list
             self.q_pred_list_[:, k + 1] = q_pred
             self.dq_pred_list_[:, k + 1] = dq_pred
-            self.tau_pred_list_[:, k + 1] = tau_pred
+            # Store in actuation space for DSM_tau (truncate/pad if needed).
+            tmp = np.zeros(self.tau_pred_list_.shape[0], dtype=float)
+            n = int(min(int(tmp.shape[0]), int(np.asarray(tau_u).shape[0])))
+            tmp[:n] = np.asarray(tau_u, dtype=float).reshape(-1)[:n]
+            self.tau_pred_list_[:, k + 1] = tmp
             
             # Store body pose from calc_dynamics return
-            # body_pose_translation contains poses for all 7 links + panda_hand + 2 fingers
-            # Store in body_pose_list_ for this prediction step
-            for link_idx in range(8):
+            # body_pose_translation contains poses for tracked bodies; store for this step
+            for link_idx in range(len(self.tracked_bodies)):
                 self.body_pose_list_[link_idx, :, k + 1] = body_pose_translation[:, link_idx]
             
             # Get FCL distances if available
@@ -903,87 +865,37 @@ class ExplicitReferenceGovernor:
         M = self.plant_pred.CalcMassMatrix(self.plant_context)                    # mass matrix
         C = self.plant_pred.CalcBiasTerm(self.plant_context)                      # bias term
         
+        # Cache sizes once
+        nq = self.num_positions
         # Extract current state components
-        q = x[:self.num_positions]  # positions
-        dq = x[self.num_positions:]  # velocities
+        q = x[:nq]  # positions
+        dq = x[nq:]  # velocities
         
-        # PD controller with gravity compensation
-        kp = np.array(self.Kp_)
-        kd = np.array(self.Kd_)
-        U = self.num_joints  # Number of actual robot joints
-        
-        # Control law: u = kp * (qv - q) + kd * dq - tau_g
-        # Apply control to the robot joints
-        u_control = kp * (qv[:U] - q[:U]) - kd * dq[:U] - tau_g[:U]
-        
-        # Add zeros for any extra joints beyond num_joints
-        if self.num_positions > U:
-            u_control = np.concatenate([u_control, np.zeros(self.num_positions - U)])
-        
-        # End effector control (commented out in original)
-        # J_pseudo = J.completeOrthogonalDecomposition().pseudoInverse()
-        # u_control = -kp * J_pseudo * p_diff - kd * dq[:U] - tau_g[:U]
-        
+        # Use the provided generalized torques `u` (computed in trajectoryPredictions from RobotSpec/ErgParams).
+        # Convention: u already contains gravity compensation term (-tau_g) for controlled joints, so dynamics uses
+        # (u - C + tau_g) to cancel gravity consistently with the original implementation.
+        u = np.asarray(u, dtype=float).reshape(-1)
+        if u.shape[0] != nq:
+            u_full = np.zeros(nq, dtype=float)
+            n = min(nq, u.shape[0])
+            u_full[:n] = u[:n]
+            u = u_full
 
-        ddq = np.linalg.pinv(M) @ (u_control - C + tau_g)
+        ddq = np.linalg.pinv(M) @ (u - C + tau_g)
         
         # Euler integration to get next state
-        dt = 0.01  # time step
+        dt = self.prediction_dt_  # time step (from PredictionParams in CERG_Setup)
         dq_next = dq + ddq * dt
         q_next = q + dq_next * dt
 
         x_next = np.concatenate([q_next, dq_next])
         
-        # Calculate body pose using current q_pred (q) for all joints
+        # Calculate body pose using current plant context
         try:
-            # Set plant to current joint positions
-            # self.plant_pred.SetPositions(self.plant_context, 0, q)  # Assuming model instance 0
-            
-            # Define link range (similar to C++ code)
-            init_link_id = 1  # Start from panda_link1
-            final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 3  # 7 links + panda_hand + 2 fingers
-            
-            # Initialize plant_positions matrix (3 x s)
-            plant_positions = np.zeros((3, s))
-            
-            # Calculate poses for all joints from init_link_id to final_link_id
-            for j in range(init_link_id, final_link_id + 1):
-                body_name = f"panda_link{j}"
-                body = self.plant_pred.GetBodyByName(body_name)
-                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
-                plant_positions[:, j - init_link_id] = plant_joint_position
-
-            # Also include panda_hand as column 7 (8th tracked body)
-            try:
-                hand_body = self.plant_pred.GetBodyByName("panda_hand")
-                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
-                plant_positions[:, 7] = hand_pos
-            except Exception:
-                plant_positions[:, 7] = 0.0
-
-            # Include panda fingers as columns 8 and 9 (9th and 10th tracked bodies)
-            try:
-                leftfinger_body = self.plant_pred.GetBodyByName("panda_leftfinger")
-                leftfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, leftfinger_body).translation()
-                plant_positions[:, 8] = leftfinger_pos
-            except Exception:
-                plant_positions[:, 8] = 0.0
-                
-            try:
-                rightfinger_body = self.plant_pred.GetBodyByName("panda_rightfinger")
-                rightfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, rightfinger_body).translation()
-                plant_positions[:, 9] = rightfinger_pos
-            except Exception:
-                plant_positions[:, 9] = 0.0
-
-            # Return all link poses (7 links + hand + 2 fingers)
-            body_pose_translation = plant_positions
-            
+            body_pose_translation = self._tracked_body_positions_world()  # (3, B)
         except Exception as e:
             print(f"Body pose calculation failed in calc_dynamics: {e}")
-            body_pose_translation = np.zeros((3, 10))  # Return 3x10 matrix for 7 links + hand + 2 fingers
+            body_pose_translation = np.zeros((3, len(self.tracked_bodies)), dtype=float)  # (3, B)
         
         # Return both next state and body pose translation
         return x_next, body_pose_translation
@@ -993,67 +905,76 @@ class ExplicitReferenceGovernor:
         """
         Compute the DSM for joint torques.
         """
+        delta = self.erg_params.robust_delta_tau
+        kappa = self.erg_params.kappa_tau
         for k in range(self.tau_pred_list_.shape[1]):  # number of prediction samples + 1
             tau_pred = self.tau_pred_list_[:, k]
-            DSM_tau_temp = self.distanceTau(tau_pred) - self.robust_delta_tau_
+            DSM_tau_temp = self.distanceTau(tau_pred) - delta
             if k == 0:
                 DSM_tau = DSM_tau_temp
             else:
                 DSM_tau = min(DSM_tau, DSM_tau_temp)
 
-        DSM_tau = self.kappa_tau_ * DSM_tau
+        DSM_tau = kappa * DSM_tau
         return DSM_tau
 
     def dsmQ(self):
         """
         Compute the DSM for joint positions.
         """
+        delta = self.erg_params.robust_delta_q
+        kappa = self.erg_params.kappa_q
         for k in range(self.q_pred_list_.shape[1]):  # number of prediction samples + 1
             q_pred = self.q_pred_list_[:, k]
-            DSM_q_temp = self.distanceQ(q_pred) - self.robust_delta_q_
+            DSM_q_temp = self.distanceQ(q_pred) - delta
             if k == 0:
                 DSM_q = DSM_q_temp
             else:
                 DSM_q = min(DSM_q, DSM_q_temp)
 
-        DSM_q = self.kappa_q_ * DSM_q
+        DSM_q = kappa * DSM_q
         return DSM_q
 
     def dsmDq(self):
         """
         Compute the DSM for joint velocities.
         """
+        delta = self.erg_params.robust_delta_dq
+        kappa = self.erg_params.kappa_dq
         for k in range(self.dq_pred_list_.shape[1]):  # number of prediction samples + 1
             dotq_pred = self.dq_pred_list_[:, k]
-            DSM_dotq_temp = self.distanceDq(dotq_pred) - self.robust_delta_dq_
+            DSM_dotq_temp = self.distanceDq(dotq_pred) - delta
             if k == 0:
                 DSM_dotq = DSM_dotq_temp
             else:
                 DSM_dotq = min(DSM_dotq, DSM_dotq_temp)
 
-        DSM_dotq = self.kappa_dq_ * DSM_dotq
+        DSM_dotq = kappa * DSM_dotq
         return DSM_dotq
 
     def dsmDpEE(self):
         """
         Compute the DSM for end-effector velocities.
         """
+        delta = self.erg_params.robust_delta_dp_EE
+        kappa = self.erg_params.kappa_dp_EE
         for k in range(self.q_pred_list_.shape[1]):  # number of prediction samples + 1
             q_pred = self.q_pred_list_[:, k]
             dotq_pred = self.dq_pred_list_[:, k]
-            DSM_dotp_EE_temp = self.distanceDpEE(q_pred, dotq_pred) - self.robust_delta_dp_EE_            
+            DSM_dotp_EE_temp = self.distanceDpEE(q_pred, dotq_pred) - delta
             if k == 0:
                 DSM_dotp_EE = DSM_dotp_EE_temp
             else:
                 DSM_dotp_EE = min(DSM_dotp_EE, DSM_dotp_EE_temp)
 
-        DSM_dotp_EE = self.kappa_dp_EE_ * DSM_dotp_EE
+        DSM_dotp_EE = kappa * DSM_dotp_EE
         return DSM_dotp_EE
 
     def dsmS(self, box_position):
         """
         Compute the DSM for distance-based safety margin.
         """
+        kappa_q = self.erg_params.kappa_q
         for k in range(self.q_pred_list_.shape[1]):  # number of prediction samples + 1
             q_pred = self.q_pred_list_[:, k]
             DSM_s_temp = self.calculateDsmS(box_position, k)  # Use robust_delta_q_ for distance safety margin
@@ -1062,14 +983,14 @@ class ExplicitReferenceGovernor:
             else:
                 DSM_s = min(DSM_s, DSM_s_temp)
 
-        DSM_s = self.kappa_q_ * DSM_s  # Use kappa_q_ as scaling factor
+        DSM_s = kappa_q * DSM_s  # Use kappa_q as scaling factor
         return DSM_s
 
     def dsmEnergy(self, total_energy,box_position, dsm_s):
 
         # DSM energy: max(kappaS * dsm_s, kappaE * (E_max - E_current))
         kappaS = 1.0  # You can adjust this parameter
-        kappaE = self.kappa_terminal_energy_
+        kappaE = self.erg_params.kappa_terminal_energy
         
         DSM_energy = max(kappaS * dsm_s, kappaE * (self.E_max_ - total_energy))
         return DSM_energy
@@ -1084,14 +1005,13 @@ class ExplicitReferenceGovernor:
         
 
         if self.body_pose_list_.shape[2] > 0:  # Check if we have stored positions
-            # Use the first prediction step (index 0) for current positions
-            plant_positions = self.body_pose_list_[:, :, k]  # Shape: (10, 3) - 7 links + hand + 2 fingers, 3 coordinates
-            plant_positions = plant_positions.T  # Transpose to get (3, 10) format
+            # Use the first prediction step (index k) for current positions
+            plant_positions = self.body_pose_list_[:, :, k]  # Shape: (B, 3)
+            plant_positions = plant_positions.T  # Transpose to get (3, B) format
         else:
             # Fallback: return infinite if no stored positions
             return float('inf')
         
-        # Define constraint vector
         c = np.array([-1.0, 0.0, 0.0])  # Vector c = [-1, 0, 0]
         
         # Box position constraint - use box's x value
@@ -1104,6 +1024,8 @@ class ExplicitReferenceGovernor:
             # Calculate: (box_constraint - c.dot(link_pos))
             distance = box_constraint - np.dot(c, link_pos)
             wall = min(distance, wall)
+            if wall < -1e-12:
+                print(f"Wall is negative: {wall}")
         
         # Return the minimum wall value
         return wall

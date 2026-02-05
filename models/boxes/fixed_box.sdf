@@ -6,14 +6,14 @@
       <visual name="visual">
         <geometry>
           <box>
-            <size>7 7 0.1</size>
+            <size>7 7 0.001</size>
           </box>
         </geometry>
       </visual>
       <collision name="collision">
         <geometry>
           <box>
-            <size>7 7 0.1</size>
+            <size>7 7 0.001</size>
           </box>
         </geometry>
         <surface>
@@ -24,6 +24,13 @@
             </ode>
           </friction>
         </surface>
+        <!-- Drake contact properties (so this actually behaves like a floor/table) -->
+        <drake:proximity_properties>
+          <drake:rigid_hydroelastic/>
+          <drake:hunt_crossley_dissipation>1.0</drake:hunt_crossley_dissipation>
+          <drake:mu_static>0.9</drake:mu_static>
+          <drake:mu_dynamic>0.89</drake:mu_dynamic>
+        </drake:proximity_properties>
       </collision>
       <pose>0.0 0 0.0 0 0 0</pose>
     </link>

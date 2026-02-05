@@ -464,7 +464,7 @@
     <drake:member link="panda_link6"/>
     <drake:member link="panda_link7"/>
     <drake:member link="panda_hand"/>
-    <drake:member link="panda_rightfinger"/>
-    <drake:member link="panda_leftfinger"/>
+    <!-- <drake:member link="panda_rightfinger"/>
+    <drake:member link="panda_leftfinger"/> -->
     <drake:ignored_collision_filter_group name="all"/>
   </drake:collision_filter_group>

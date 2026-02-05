@@ -1,3 +1,5 @@
 drake_envs/
 .idea
 
+__pycache__/
+*.pyc

@@ -22,7 +22,8 @@ import csv
 from pydrake.all import *
 # import pydot
 from IPython.display import SVG, display
-from trajectoryERG import ExplicitReferenceGovernor
+from trajectoryERG import CompliantERG
+from CERG_Setup import ErgParams, ContactParams, panda_spec
 import os
 from pydrake.visualization import AddDefaultVisualization
 
@@ -260,10 +261,14 @@ class ERG(LeafSystem):
             period_sec=0.01,  # time step.
             offset_sec=0.0,  # The first event is at time zero.
             update=self.refrence) # Call the Update method defined below.
-        self.erg = ExplicitReferenceGovernor(
-            robust_delta_tau_=0.1, kappa_tau_=1.0,
-            robust_delta_q_=0.1, kappa_q_=15.0, robust_delta_dq_=0.1, kappa_dq_=7.0,
-            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0)
+        urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_drake.urdf"))
+        robot_spec = panda_spec(urdf_path)
+        erg_params = ErgParams()
+        contact_params = ContactParams()
+        self.erg = CompliantERG(
+            robot_spec=robot_spec,
+            erg_params=erg_params,
+            contact_params=contact_params)
 
         # Initialize a flag to check if it's the first update
         self.first_update = True
