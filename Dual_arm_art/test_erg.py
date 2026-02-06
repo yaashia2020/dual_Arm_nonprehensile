@@ -224,8 +224,11 @@ class ERG(LeafSystem):
         tau = self._tau_port.Eval(context)
         q_r = self._qr_port.Eval(context)
         box_state = self._box_state_port.Eval(context)
-        # Extract and post-process box position (subtract 0.11 from x)
-        box_position = np.array(box_state[4:7], dtype=float)
+        # Box center position (true world position, used for FCL collision box placement)
+        box_position_center = np.array(box_state[4:7], dtype=float)
+
+        # Box position used for constraints / face-tracking (subtract half-length in X)
+        box_position = box_position_center.copy()
         box_position[0] -= 0.11
 
         self.q_v = context.get_discrete_state_vector().CopyToVector()              
@@ -235,10 +238,18 @@ class ERG(LeafSystem):
             self.first_update = False
         
         # Update box position in ERG
-        self.q_v_ = self.erg.get_qv(q, dq, tau, q_r, self.q_v_, box_position)
+        self.q_v_ = self.erg.get_qv(
+            q, dq, tau, q_r, self.q_v_,
+            box_position,
+            box_position_fcl=box_position_center,
+        )
         
         # Calculate energy from trajectory predictions
-        self.calculated_energy = self.erg.get_energy(q, dq, tau, q_r, self.q_v_, box_position)
+        self.calculated_energy = self.erg.get_energy(
+            q, dq, tau, q_r, self.q_v_,
+            box_position,
+            box_position_fcl=box_position_center,
+        )
 
         # Write into the output vector.
         discrete_state.get_mutable_vector().SetFromVector(self.q_v_)

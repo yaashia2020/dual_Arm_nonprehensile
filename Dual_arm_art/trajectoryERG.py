@@ -157,12 +157,27 @@ class ExplicitReferenceGovernor:
         self.q_pred_list_ = np.zeros((self.num_positions, self.num_pred_samples_ + 1))
         self.dq_pred_list_ = np.zeros((self.num_velocities, self.num_pred_samples_ + 1))
         self.tau_pred_list_ = np.zeros((self.plant_pred.get_actuation_input_port().size(), self.num_pred_samples_ + 1))
+
+        # If FCL is enabled, store x-axis distances (nearest-point delta in X) for each FCL robot object
+        # across the prediction horizon. Shape: (num_fcl_links, num_pred_samples_ + 1)
+        self.fcl_x_dist_list_ = None
+        if self.fcl_available and hasattr(self, "fcl_robot_links"):
+            self.fcl_x_dist_list_ = np.full(
+                (len(self.fcl_robot_links), self.num_pred_samples_ + 1),
+                float("inf"),
+                dtype=float,
+            )
         
+        # ---- Tracked bodies for DSM_s / debugging ----
+        # We track link translations over the prediction horizon. This list is dynamic based on what bodies
+        # exist in the URDF, and includes rubber pad if present.
+        self.tracked_body_names = self._build_tracked_body_list()
+        self.num_tracked_bodies = len(self.tracked_body_names)
+
         # Arrays to store body poses (translation part) for each prediction step
-        # Store poses for 7 links (panda_link1..panda_link7) PLUS panda_hand PLUS 2 fingers for each prediction step
-        # Shape: (10 tracked bodies, 3 coordinates (X,Y,Z), prediction steps)
-        # Order: panda_link1-7, panda_hand, panda_leftfinger, panda_rightfinger
-        self.body_pose_list_ = np.zeros((10, 3, self.num_pred_samples_ + 1))
+        # Shape: (num_tracked_bodies, 3 coordinates (X,Y,Z), prediction steps)
+        # Order: self.tracked_body_names
+        self.body_pose_list_ = np.zeros((self.num_tracked_bodies, 3, self.num_pred_samples_ + 1))
         
         # Limits for joint angles, velocities, and torques - dynamic based on num_joints
         if num_joints == 7:
@@ -186,6 +201,57 @@ class ExplicitReferenceGovernor:
         self.limit_dp_EE_ = [1.7, 2.5]  # Translation and rotation limits for the end effector
         self.E_max_ = 5.0  # Maximum energy limit
 
+    def _build_tracked_body_list(self):
+        """
+        Build the list of body names whose translations we track in body_pose_list_.
+        Always includes panda_link1..7 and panda_hand.
+        Adds fingers and rubber pad if they exist (best-effort).
+        """
+        tracked = [f"panda_link{i}" for i in range(1, 8)] + ["panda_hand"]
+
+        # Add fingers if present
+        for name in ["panda_leftfinger", "panda_rightfinger"]:
+            try:
+                self.plant_pred.GetBodyByName(name)
+                tracked.append(name)
+            except Exception:
+                pass
+
+        # Also add rubber pad if present (some URDFs use pad instead of fingers)
+        for pad_name in ["rubber_pad", "panda_rubber_pad", "gripper_pad"]:
+            try:
+                self.plant_pred.GetBodyByName(pad_name)
+                if pad_name not in tracked:
+                    tracked.append(pad_name)
+                break
+            except Exception:
+                continue
+
+        # De-duplicate while preserving order
+        deduped = []
+        seen = set()
+        for name in tracked:
+            if name not in seen:
+                deduped.append(name)
+                seen.add(name)
+
+        print(f"Tracked bodies for DSM_s: {deduped}")
+        return deduped
+
+    def _calc_tracked_body_positions(self, context):
+        """
+        Returns a (3, num_tracked_bodies) array of body translations in world frame.
+        Missing bodies are filled with zeros.
+        """
+        plant_positions = np.zeros((3, self.num_tracked_bodies))
+        for i, body_name in enumerate(self.tracked_body_names):
+            try:
+                body = self.plant_pred.GetBodyByName(body_name)
+                plant_positions[:, i] = self.plant_pred.EvalBodyPoseInWorld(context, body).translation()
+            except Exception:
+                plant_positions[:, i] = 0.0
+        return plant_positions
+
     def _build_fcl_collision_objects(self):
         """
         Pre-build FCL collision objects for robot links with modular finger detection.
@@ -196,43 +262,40 @@ class ExplicitReferenceGovernor:
             
         # Define base links that should always exist
         base_link_names = ["panda_link7", "panda_hand"]
-        
+
+        # Detect optional end-effector bodies (fingers and/or rubber pad).
+        detected_effectors = []
+
         # Try to detect fingers in the URDF
         finger_names = ["panda_leftfinger", "panda_rightfinger"]
-        detected_fingers = []
-        
         for finger_name in finger_names:
             try:
-                body = self.plant_pred.GetBodyByName(finger_name)
-                detected_fingers.append(finger_name)
+                self.plant_pred.GetBodyByName(finger_name)
+                detected_effectors.append(finger_name)
                 print(f"Detected finger: {finger_name}")
             except Exception:
                 print(f"Finger {finger_name} not found in URDF")
-        
-        # If no fingers detected, use rubber pad
-        if not detected_fingers:
-            print("No fingers detected, using rubber pad")
-            # Try different rubber pad names
-            rubber_pad_names = ["rubber_pad", "panda_rubber_pad", "gripper_pad"]
-            rubber_pad_found = False
-            
-            for pad_name in rubber_pad_names:
-                try:
-                    body = self.plant_pred.GetBodyByName(pad_name)
-                    detected_fingers.append(pad_name)
-                    rubber_pad_found = True
-                    print(f"Using rubber pad: {pad_name}")
-                    break
-                except Exception:
-                    continue
-            
-            if not rubber_pad_found:
-                print("No rubber pad found, using panda_hand as fallback")
-                detected_fingers.append("panda_hand")
-        
+
+        # Also detect rubber pad if present (even if fingers exist)
+        rubber_pad_names = ["rubber_pad", "panda_rubber_pad", "gripper_pad"]
+        for pad_name in rubber_pad_names:
+            try:
+                self.plant_pred.GetBodyByName(pad_name)
+                if pad_name not in detected_effectors:
+                    detected_effectors.append(pad_name)
+                    print(f"Detected rubber pad: {pad_name}")
+                break
+            except Exception:
+                continue
+
+        # If neither fingers nor rubber pad exist, fall back to panda_hand
+        if not detected_effectors:
+            print("No fingers/rubber pad detected, using panda_hand as fallback end-effector")
+            detected_effectors.append("panda_hand")
+
         # Build collision objects for all detected links
         self.fcl_robot_links = []
-        all_link_names = base_link_names + detected_fingers
+        all_link_names = base_link_names + detected_effectors
         
         for link_name in all_link_names:
             try:
@@ -278,7 +341,7 @@ class ExplicitReferenceGovernor:
             T_WC = T_WL @ T_LC
             obj.setTransform(self.fcl.Transform(T_WC[:3, :3], T_WC[:3, 3]))
 
-    def get_qv(self, q, dq, tau, q_r, q_v, box_position=None):
+    def get_qv(self, q, dq, tau, q_r, q_v, box_position=None, box_position_fcl=None):
         """
         Compute the new reference joint positions using the navigation field and DSM.
         
@@ -288,7 +351,8 @@ class ExplicitReferenceGovernor:
             tau (np.array): Current joint torques.
             q_r (np.array): Desired reference joint positions.
             q_v (np.array): Current applied reference joint positions.
-            box_position (np.array): Current box position
+            box_position (np.array): Box position used for constraints / navigation (often a "face" point).
+            box_position_fcl (np.array): Box position used for FCL collision box placement (true center, no shift).
         
         Returns:
             np.array: Updated reference joint positions.
@@ -296,8 +360,12 @@ class ExplicitReferenceGovernor:
 
         
         
+        # Backward compatible: if not provided, use the same box_position for FCL as well.
+        if box_position_fcl is None:
+            box_position_fcl = box_position
+
         rho_ = self.navigationField(q_r, q_v, box_position)
-        DSM_ = self.trajectoryBasedDSM(q, dq, tau, q_v, box_position)
+        DSM_ = self.trajectoryBasedDSM(q, dq, tau, q_v, box_position, box_position_fcl)
 
         q_v_new = q_v + DSM_ * rho_ * self.dt_ 
         
@@ -308,7 +376,7 @@ class ExplicitReferenceGovernor:
         
         return q_v_new
 
-    def get_energy(self, q, dq, tau, q_r, q_v, box_position=None):
+    def get_energy(self, q, dq, tau, q_r, q_v, box_position=None, box_position_fcl=None):
         """
         Get the calculated energy from trajectory predictions.
         
@@ -318,13 +386,20 @@ class ExplicitReferenceGovernor:
             tau (np.array): Current joint torques.
             q_r (np.array): Desired reference joint positions.
             q_v (np.array): Current applied reference joint positions.
-            box_position (np.array): Current box position
+            box_position (np.array): Box position used for constraints / navigation (often a "face" point).
+            box_position_fcl (np.array): Box position used for FCL collision box placement (true center, no shift).
         
         Returns:
             float: Calculated total energy.
         """
         # Get trajectory predictions and return the calculated energy
-        total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v, box_position)
+        # Backward compatible: if not provided, use the same box_position for FCL as well.
+        if box_position_fcl is None:
+            box_position_fcl = box_position
+
+        total_energy = self.trajectoryPredictions(
+            np.concatenate((q, dq)), tau, q_v, box_position=box_position, box_position_fcl=box_position_fcl
+        )
         # print(f"Total energy: {total_energy}")
         return total_energy
 
@@ -354,7 +429,7 @@ class ExplicitReferenceGovernor:
             rho_soft = self.soft_navigation_field(box_position_constraint, q_v)
 
         # Total navigation field
-        rho = rho_att 
+        rho = rho_att + rho_rep_q + rho_soft
         return rho
 
     def soft_navigation_field(self, box_position_constraint, q_v):
@@ -505,13 +580,17 @@ class ExplicitReferenceGovernor:
         
         return soft_rep
 
-    def trajectoryBasedDSM(self, q, dq, tau, q_v, box_position):
+    def trajectoryBasedDSM(self, q, dq, tau, q_v, box_position, box_position_fcl=None):
       """
       Compute the Dynamic Safety Margin (DSM) based on trajectory predictions.
       """
+      if box_position_fcl is None:
+          box_position_fcl = box_position
       # Get trajectory predictions and save predicted q, dq, and tau in lists
       start_time = time.time()
-      total_energy = self.trajectoryPredictions(np.concatenate((q, dq)), tau, q_v, box_position)
+      total_energy = self.trajectoryPredictions(
+          np.concatenate((q, dq)), tau, q_v, box_position=box_position, box_position_fcl=box_position_fcl
+      )
 
       # Compute DSMs
       DSM_tau_ = self.dsmTau()
@@ -539,7 +618,7 @@ class ExplicitReferenceGovernor:
       
       return DSM
 
-    def trajectoryPredictions(self, state, tau, q_v, box_position=None):
+    def trajectoryPredictions(self, state, tau, q_v, box_position=None, box_position_fcl=None):
         """
         Predict joint positions, velocities, and torques over the prediction horizon.
         
@@ -547,7 +626,10 @@ class ExplicitReferenceGovernor:
             state: Current state [q, dq]
             tau: Current torques
             q_v: Reference joint positions
-            box_position: Box position [x, y, z] for collision detection
+            box_position: Box position [x, y, z] used for DSM/constraints (often a "face" point).
+            box_position_fcl: Box position [x, y, z] used to place the FCL collision box (true center, no shift).
+        if box_position_fcl is None:
+            box_position_fcl = box_position
         """
         q_pred, dq_pred = state[:self.num_joints], state[self.num_joints:]
         tau_pred = tau
@@ -592,56 +674,25 @@ class ExplicitReferenceGovernor:
         self.dq_pred_list_[:, 0] = dq_pred
         self.tau_pred_list_[:, 0] = tau_pred
         
-        # Calculate and store initial body pose
+        # Calculate and store initial body pose (for all tracked bodies)
         try:
-            # Set plant to initial q_pred
-            self.plant_pred.SetPositions(self.plant_context, q_pred)  # Remove model_instance parameter
-            
-            # Define link range (similar to C++ code)
-            init_link_id = 1  # Start from panda_link1
-            final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 3  # 7 links + panda_hand + 2 fingers
-            
-            # Initialize plant_positions matrix (3 x s)
-            plant_positions = np.zeros((3, s))
-            
-            # Calculate poses for all joints from init_link_id to final_link_id
-            for j in range(init_link_id, final_link_id + 1):
-                body_name = f"panda_link{j}"
-                body = self.plant_pred.GetBodyByName(body_name)
-                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                plant_positions[:, j - init_link_id] = plant_joint_position
-
-            # Also include panda_hand as the 8th tracked body
-            try:
-                hand_body = self.plant_pred.GetBodyByName("panda_hand")
-                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
-                plant_positions[:, 7] = hand_pos
-            except Exception:
-                plant_positions[:, 7] = 0.0
-            
-            # Include panda fingers as the 9th and 10th tracked bodies
-            try:
-                leftfinger_body = self.plant_pred.GetBodyByName("panda_leftfinger")
-                leftfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, leftfinger_body).translation()
-                plant_positions[:, 8] = leftfinger_pos
-            except Exception:
-                plant_positions[:, 8] = 0.0
-                
-            try:
-                rightfinger_body = self.plant_pred.GetBodyByName("panda_rightfinger")
-                rightfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, rightfinger_body).translation()
-                plant_positions[:, 9] = rightfinger_pos
-            except Exception:
-                plant_positions[:, 9] = 0.0
-            
-            # Store all link poses (7 links + hand + 2 fingers) in body_pose_list_
-            for link_idx in range(10):
+            self.plant_pred.SetPositions(self.plant_context, q_pred)
+            plant_positions = self._calc_tracked_body_positions(self.plant_context)  # (3, N)
+            for link_idx in range(self.num_tracked_bodies):
                 self.body_pose_list_[link_idx, :, 0] = plant_positions[:, link_idx]
-                
         except Exception as e:
             print(f"Initial body pose calculation failed: {e}")
             self.body_pose_list_[:, :, 0] = 0.0
+
+        # Store initial FCL x-distances (k=0) if enabled
+        if self.fcl_available and box_position_fcl is not None and self.fcl_x_dist_list_ is not None:
+            try:
+                fcl_x0 = self.get_fcl_x_distances(q_pred, box_position_fcl, pred_step=0)
+                if fcl_x0 is not None:
+                    self.fcl_x_dist_list_[:, 0] = np.array(fcl_x0, dtype=float)
+            except Exception:
+                # Keep inf defaults
+                pass
 
         for k in range(self.num_pred_samples_):
         
@@ -669,7 +720,9 @@ class ExplicitReferenceGovernor:
 
             # Solve for x[k+1] using the computed tau_pred
             
-            state_pred, body_pose_translation = self.calc_dynamics(np.concatenate((q_pred, dq_pred)), tau_pred, q_v)  # Adjust this based on your calculation method
+            state_pred, body_pose_translation = self.calc_dynamics(
+                np.concatenate((q_pred, dq_pred)), tau_pred, q_v
+            )
             q_pred = state_pred[:self.num_positions]
             dq_pred = state_pred[self.num_positions:]
 
@@ -684,17 +737,16 @@ class ExplicitReferenceGovernor:
             self.dq_pred_list_[:, k + 1] = dq_pred
             self.tau_pred_list_[:, k + 1] = tau_pred
             
-            # Store body pose from calc_dynamics return
-            # body_pose_translation contains poses for all 7 links + panda_hand + 2 fingers
-            # Store in body_pose_list_ for this prediction step
-            for link_idx in range(8):
+            # Store body pose from calc_dynamics return for this prediction step
+            # body_pose_translation is (3, num_tracked_bodies)
+            for link_idx in range(self.num_tracked_bodies):
                 self.body_pose_list_[link_idx, :, k + 1] = body_pose_translation[:, link_idx]
             
             # Get FCL distances if available
-            if self.fcl_available and box_position is not None:
+            if self.fcl_available and box_position_fcl is not None:
                 try:
                     # Get FCL normal distances from robot links to box
-                    fcl_distances = self.get_fcl_distances(q_pred, box_position)
+                    fcl_distances = self.get_fcl_distances(q_pred, box_position_fcl, pred_step=k + 1)
                     if fcl_distances is not None:
                         # Dynamic print based on actual number of collision objects
                         link_names = [name for _, name, _, _ in self.fcl_robot_links]
@@ -702,8 +754,12 @@ class ExplicitReferenceGovernor:
                         print(f"FCL normal distances in prediction step {k+1}: {distance_str}")
                     
                     # Get FCL X-axis distances from robot links to box
-                    fcl_x_distances = self.get_fcl_x_distances(q_pred, box_position)
+                    fcl_x_distances = self.get_fcl_x_distances(q_pred, box_position_fcl, pred_step=k + 1)
                     if fcl_x_distances is not None:
+                        # Store x-distances for DSM_s usage (only for calculated FCL objects)
+                        if self.fcl_x_dist_list_ is not None and len(fcl_x_distances) == self.fcl_x_dist_list_.shape[0]:
+                            self.fcl_x_dist_list_[:, k + 1] = np.array(fcl_x_distances, dtype=float)
+
                         # Dynamic print based on actual number of collision objects
                         link_names = [name for _, name, _, _ in self.fcl_robot_links]
                         distance_str = ", ".join([f"{name}={dist:.4f}" for name, dist in zip(link_names, fcl_x_distances)])
@@ -719,17 +775,18 @@ class ExplicitReferenceGovernor:
 
         return total_energy
 
-    def get_fcl_distances(self, q_pred, box_position=None):
+    def get_fcl_distances(self, q_pred, box_position=None, pred_step=None):
         """
         Get FCL distances from robot links to box.
-        Creates collision objects dynamically based on box position.
+        Uses pre-built collision objects (self.fcl_robot_links) and updates transforms from plant context.
         
         Args:
             q_pred: Predicted joint positions
             box_position: Box position [x, y, z] (optional)
         
         Returns:
-            List of distances [link7, hand, leftfinger, rightfinger] or None if not available
+            List of signed distances in the same order as self.fcl_robot_links (dummy entries return inf),
+            or None if not available.
         """
         if not self.fcl_available or box_position is None:
             return None
@@ -737,24 +794,9 @@ class ExplicitReferenceGovernor:
         try:
             # Set plant to predicted configuration
             self.plant_pred.SetPositions(self.plant_context, q_pred)
-            
-            # Create FCL collision objects for robot links
-            robot_links = []
-            link_names = ["panda_link7", "panda_hand", "panda_leftfinger", "panda_rightfinger"]
-            
-            for link_name in link_names:
-                try:
-                    body = self.plant_pred.GetBodyByName(link_name)
-                    body_pose = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body)
-                    link_position = body_pose.translation()
-                    
-                    # Create 10cm cube collision object for each link
-                    geom = self.fcl.Box(0.1, 0.1, 0.1)
-                    collision_obj = self.fcl.CollisionObject(geom)
-                    collision_obj.setTransform(self.fcl.Transform(link_position))
-                    robot_links.append(collision_obj)
-                except Exception:
-                    robot_links.append(None)
+
+            # Update pre-built FCL collision objects with current poses (includes rubber_pad if present)
+            self._update_fcl_objects_from_context(self.plant_context)
             
             # Create FCL collision object for box
             box_geom = self.fcl.Box(0.22, 0.30, 0.20)  # Box dimensions
@@ -763,15 +805,14 @@ class ExplicitReferenceGovernor:
             
             # Calculate distances between robot links and box
             distances = []
-            for i, robot_link in enumerate(robot_links):
-                if robot_link is not None:
-                    # Calculate distance between robot link and box
+            for (bidx, link_name, _T_LC, robot_obj) in self.fcl_robot_links:
+                if bidx != self.plant_pred.world_body().index():  # Skip dummy objects
                     req = self.fcl.DistanceRequest(enable_signed_distance=True)
                     res = self.fcl.DistanceResult()
-                    distance = self.fcl.distance(robot_link, box_collision_obj, req, res)
+                    distance = self.fcl.distance(robot_obj, box_collision_obj, req, res)
                     distances.append(distance)
                 else:
-                    distances.append(float('inf'))  # Link not found
+                    distances.append(float('inf'))
             
             return distances
             
@@ -779,7 +820,7 @@ class ExplicitReferenceGovernor:
             print(f"FCL distance calculation failed: {e}")
             return None
 
-    def get_fcl_distances_axis(self, q_pred, box_position=None, axis='x'):
+    def get_fcl_distances_axis(self, q_pred, box_position=None, axis='x', pred_step=None):
         """
         Get FCL distances from robot links to box in a specific axis using pre-built collision objects.
         
@@ -846,7 +887,7 @@ class ExplicitReferenceGovernor:
             print(f"FCL axis distance calculation failed: {e}")
             return None
 
-    def get_fcl_x_distances(self, q_pred, box_position=None):
+    def get_fcl_x_distances(self, q_pred, box_position=None, pred_step=None):
         """
         Get FCL X-axis distances from robot links to box.
         Convenience method that returns only X distances.
@@ -858,7 +899,7 @@ class ExplicitReferenceGovernor:
         Returns:
             List of X distances [link7, hand, finger1, finger2] or None
         """
-        return self.get_fcl_distances_axis(q_pred, box_position, axis='x')
+        return self.get_fcl_distances_axis(q_pred, box_position, axis='x', pred_step=pred_step)
     '''
     TamsiSolver uses the Transition-Aware Modified Semi-Implicit (TAMSI) method, [Castro et al., 2019], 
     to solve the equations below for mechanical systems in contact with regularized friction:
@@ -933,57 +974,15 @@ class ExplicitReferenceGovernor:
         q_next = q + dq_next * dt
 
         x_next = np.concatenate([q_next, dq_next])
-        
-        # Calculate body pose using current q_pred (q) for all joints
+
+        # Calculate body pose for the NEXT state, for all tracked bodies (including rubber_pad if present)
         try:
-            # Set plant to current joint positions
-            # self.plant_pred.SetPositions(self.plant_context, 0, q)  # Assuming model instance 0
-            
-            # Define link range (similar to C++ code)
-            init_link_id = 1  # Start from panda_link1
-            final_link_id = 7  # End at panda_link7
-            s = final_link_id - init_link_id + 3  # 7 links + panda_hand + 2 fingers
-            
-            # Initialize plant_positions matrix (3 x s)
-            plant_positions = np.zeros((3, s))
-            
-            # Calculate poses for all joints from init_link_id to final_link_id
-            for j in range(init_link_id, final_link_id + 1):
-                body_name = f"panda_link{j}"
-                body = self.plant_pred.GetBodyByName(body_name)
-                plant_joint_position = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, body).translation()
-                # Store in plant_positions matrix (similar to C++: plant_positions.col(j - init_link_id))
-                plant_positions[:, j - init_link_id] = plant_joint_position
-
-            # Also include panda_hand as column 7 (8th tracked body)
-            try:
-                hand_body = self.plant_pred.GetBodyByName("panda_hand")
-                hand_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, hand_body).translation()
-                plant_positions[:, 7] = hand_pos
-            except Exception:
-                plant_positions[:, 7] = 0.0
-
-            # Include panda fingers as columns 8 and 9 (9th and 10th tracked bodies)
-            try:
-                leftfinger_body = self.plant_pred.GetBodyByName("panda_leftfinger")
-                leftfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, leftfinger_body).translation()
-                plant_positions[:, 8] = leftfinger_pos
-            except Exception:
-                plant_positions[:, 8] = 0.0
-                
-            try:
-                rightfinger_body = self.plant_pred.GetBodyByName("panda_rightfinger")
-                rightfinger_pos = self.plant_pred.EvalBodyPoseInWorld(self.plant_context, rightfinger_body).translation()
-                plant_positions[:, 9] = rightfinger_pos
-            except Exception:
-                plant_positions[:, 9] = 0.0
-
-            # Return all link poses (7 links + hand + 2 fingers)
-            body_pose_translation = plant_positions
-            
+            # Update context to next state so EvalBodyPoseInWorld matches q_next
+            xd.SetFromVector(x_next)
+            body_pose_translation = self._calc_tracked_body_positions(self.plant_context)  # (3, N)
         except Exception as e:
             print(f"Body pose calculation failed in calc_dynamics: {e}")
-            body_pose_translation = np.zeros((3, 10))  # Return 3x10 matrix for 7 links + hand + 2 fingers
+            body_pose_translation = np.zeros((3, self.num_tracked_bodies))
         
         # Return both next state and body pose translation
         return x_next, body_pose_translation
@@ -1084,9 +1083,8 @@ class ExplicitReferenceGovernor:
         
 
         if self.body_pose_list_.shape[2] > 0:  # Check if we have stored positions
-            # Use the first prediction step (index 0) for current positions
-            plant_positions = self.body_pose_list_[:, :, k]  # Shape: (10, 3) - 7 links + hand + 2 fingers, 3 coordinates
-            plant_positions = plant_positions.T  # Transpose to get (3, 10) format
+            plant_positions = self.body_pose_list_[:, :, k]  # (N, 3)
+            plant_positions = plant_positions.T              # (3, N)
         else:
             # Fallback: return infinite if no stored positions
             return float('inf')
@@ -1097,16 +1095,29 @@ class ExplicitReferenceGovernor:
         # Box position constraint - use box's x value
         box_constraint = box_position[0]  # Use x coordinate of box position
         
-        # Calculate minimum distance using the C++ logic pattern
+        # --- Existing "wall" metric (keep as-is) ---
         wall = float('inf')
-        for k in range(plant_positions.shape[1]):
-            link_pos = plant_positions[:, k]
-            # Calculate: (box_constraint - c.dot(link_pos))
+        for i in range(plant_positions.shape[1]):
+            link_pos = plant_positions[:, i]
             distance = box_constraint - np.dot(c, link_pos)
             wall = min(distance, wall)
-        
-        # Return the minimum wall value
-        return wall
+
+        # --- FCL-based x-axis signed distance (ONLY for calculated FCL objects) ---
+        # If available, use the minimum X-axis nearest-point delta across real FCL objects at this step.
+        # This does not replace the wall metric for non-FCL-tracked bodies; we take the min of both.
+        fcl_x_min = float("inf")
+        if self.fcl_available and self.fcl_x_dist_list_ is not None:
+            try:
+                if 0 <= k < self.fcl_x_dist_list_.shape[1]:
+                    # Filter out dummy entries (inf) and take min
+                    vals = self.fcl_x_dist_list_[:, k]
+                    finite = vals[np.isfinite(vals)]
+                    if finite.size > 0:
+                        fcl_x_min = float(np.min(finite))
+            except Exception:
+                pass
+
+        return min(wall, fcl_x_min)
 
     def distanceTau(self, tau_pred):
         for i in range(self.num_joints):

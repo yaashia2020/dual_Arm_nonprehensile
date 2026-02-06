@@ -361,6 +361,13 @@ class ERG(LeafSystem):
         
         # Add output port for calculated energy
         self.DeclareVectorOutputPort("calculated_energy", size=1, calc=self.output_energy)
+
+        # Expose the box position as used *inside* the ERG (after local preprocessing / offsets)
+        # This makes it easy to log + plot what Trajectory ERG is actually seeing.
+        self._box_position_used_in_erg = np.zeros(3)
+        self.DeclareVectorOutputPort(
+            "box_position_used_in_erg", size=3, calc=self.output_box_position_used_in_erg
+        )
         
         self.DeclarePeriodicDiscreteUpdateEvent(
             period_sec=0.01,  # time step.
@@ -386,9 +393,13 @@ class ERG(LeafSystem):
         tau = self._tau_port.Eval(context)
         q_r = self._qr_port.Eval(context)
         box_state = self._box_state_port.Eval(context)
-        # Extract and post-process box position (subtract 0.11 from x)
-        box_position = np.array(box_state[4:7], dtype=float)
+        # Box center position (true world position, used for FCL collision box placement)
+        box_position_center = np.array(box_state[4:7], dtype=float)
+
+        # Box position used for constraints / face-tracking (subtract half-length in X)
+        box_position = box_position_center.copy()
         box_position[0] -= 0.11
+        self._box_position_used_in_erg = box_position.copy()
 
         self.q_v = context.get_discrete_state_vector().CopyToVector()              
         # Initialize q_v_ only at the first callback
@@ -397,10 +408,18 @@ class ERG(LeafSystem):
             self.first_update = False
         
         # Update box position in ERG
-        self.q_v_ = self.erg.get_qv(q, dq, tau, q_r, self.q_v_, box_position)
+        self.q_v_ = self.erg.get_qv(
+            q, dq, tau, q_r, self.q_v_,
+            box_position,
+            box_position_fcl=box_position_center,
+        )
         
         # Calculate energy from trajectory predictions
-        self.calculated_energy = self.erg.get_energy(q, dq, tau, q_r, self.q_v_, box_position)
+        self.calculated_energy = self.erg.get_energy(
+            q, dq, tau, q_r, self.q_v_,
+            box_position,
+            box_position_fcl=box_position_center,
+        )
 
         # Write into the output vector.
         discrete_state.get_mutable_vector().SetFromVector(self.q_v_)
@@ -411,6 +430,9 @@ class ERG(LeafSystem):
             output.SetAtIndex(0, self.calculated_energy)
         else:
             output.SetAtIndex(0, 0.0)
+
+    def output_box_position_used_in_erg(self, context, output):
+        output.SetFromVector(self._box_position_used_in_erg)
 
 
 ######################################################################################################
@@ -610,11 +632,129 @@ if meshcat_visualisation:
     AddDefaultVisualization(builder=builder, meshcat=meshcat)
     # print(f"MeshCat visualization available at: {meshcat.web_url()}")
 
+# -------------------- FCL Boxes Visualization (Meshcat) --------------------
+# Visualize the same simple box primitives used by trajERG's FCL collision checking.
+if meshcat_visualisation:
+    class FCLBoxesMeshcatVisualizer(LeafSystem):
+        def __init__(self, plant, panda_id, movable_box_id, num_robot_positions, meshcat):
+            super().__init__()
+            self.plant = plant
+            self.panda_id = panda_id
+            self.movable_box_id = movable_box_id
+            self.num_robot_positions = num_robot_positions
+            self.meshcat = meshcat
+            self.temp_context = plant.CreateDefaultContext()
+
+            # Inputs
+            self.DeclareVectorInputPort("robot_state", size=num_robot_positions * 2)
+            self.DeclareVectorInputPort("box_state", size=13)
+
+            # Publish periodically
+            self.DeclarePeriodicPublishEvent(
+                period_sec=0.01, offset_sec=0.0, publish=self.DoPublish
+            )
+
+            # Build the list of robot bodies to visualize (match trajERG logic)
+            names = ["panda_link7", "panda_hand"]
+            for n in ["panda_leftfinger", "panda_rightfinger"]:
+                try:
+                    self.plant.GetBodyByName(n)
+                    names.append(n)
+                except Exception:
+                    pass
+
+            # Always include rubber pad if present (even if fingers exist)
+            for pad in ["rubber_pad", "panda_rubber_pad", "gripper_pad"]:
+                try:
+                    self.plant.GetBodyByName(pad)
+                    if pad not in names:
+                        names.append(pad)
+                    break
+                except Exception:
+                    continue
+
+            self.robot_body_names = names
+
+            # Create Meshcat objects once
+            for name in self.robot_body_names:
+                if "finger" in name.lower():
+                    dims = (0.05, 0.05, 0.05)
+                elif ("rubber" in name.lower()) or ("pad" in name.lower()):
+                    dims = (0.08, 0.08, 0.08)
+                else:
+                    dims = (0.10, 0.10, 0.10)
+
+                self.meshcat.SetObject(
+                    f"fcl/robot/{name}",
+                    Box(*dims),
+                    Rgba(1.0, 0.2, 0.2, 0.35),
+                )
+
+            # Box used for collision checking (movable_box.sdf: [0.22, 0.30, 0.20])
+            self.meshcat.SetObject(
+                "fcl/box",
+                Box(0.22, 0.30, 0.20),
+                Rgba(0.2, 0.2, 1.0, 0.25),
+            )
+
+        # Drake's periodic publish callback is invoked with (context) in pydrake.
+        def DoPublish(self, context):
+            # Robot bodies
+            robot_state = self.GetInputPort("robot_state").Eval(context)
+            q = robot_state[: self.num_robot_positions]
+
+            try:
+                self.plant.SetPositions(self.temp_context, self.panda_id, q)
+            except Exception:
+                # Fallback if model instance overload isn't available
+                try:
+                    self.plant.SetPositions(self.temp_context, q)
+                except Exception:
+                    return
+
+            for name in self.robot_body_names:
+                try:
+                    body = self.plant.GetBodyByName(name)
+                    X_WB = self.plant.EvalBodyPoseInWorld(self.temp_context, body)
+                    self.meshcat.SetTransform(f"fcl/robot/{name}", X_WB)
+                except Exception:
+                    continue
+
+            # Moving box (pose from its state)
+            try:
+                box_state = self.GetInputPort("box_state").Eval(context)
+                q_wxyz = box_state[0:4]
+                p_xyz = box_state[4:7]
+                X_WBox = RigidTransform(RotationMatrix(Quaternion(q_wxyz)), p_xyz)
+                self.meshcat.SetTransform("fcl/box", X_WBox)
+            except Exception:
+                pass
+
+    fcl_viz = builder.AddNamedSystem(
+        "FCLBoxesMeshcatVisualizer",
+        FCLBoxesMeshcatVisualizer(
+            plant=plant,
+            panda_id=panda_id,
+            movable_box_id=movable_box_id,
+            num_robot_positions=num_robot_positions,
+            meshcat=meshcat,
+        ),
+    )
+    builder.Connect(
+        plant.get_state_output_port(panda_id),
+        fcl_viz.GetInputPort("robot_state"),
+    )
+    builder.Connect(
+        plant.get_state_output_port(movable_box_id),
+        fcl_viz.GetInputPort("box_state"),
+    )
+
 logger_x = LogVectorOutput(plant.get_state_output_port(), builder) #state
 logger_tau = LogVectorOutput(pid_controller.GetOutputPort("tau_u"), builder) #tau_u
 logger_qv = LogVectorOutput(erg_system.GetOutputPort("q_v_filtered"), builder) #q_v
 logger_qr = LogVectorOutput(ik_box_tracker.GetOutputPort("ik_joint_targets"), builder) #ik targets
 logger_box_pos = LogVectorOutput(plant.get_state_output_port(box_id), builder) #box position
+logger_box_pos_used_erg = LogVectorOutput(erg_system.GetOutputPort("box_position_used_in_erg"), builder)
 
 # Add loggers for energy and contact forces
 logger_energy = LogVectorOutput(erg_system.GetOutputPort("calculated_energy"), builder) #calculated energy from ERG
@@ -682,6 +822,53 @@ class PandaLink7PoseExtractor(LeafSystem):
         # Set output to world positions
         output.SetFromVector([translation[0], translation[1], translation[2]])
 
+# Extract rubber_pad world position (similar to panda_link7 extractor)
+class RubberPadPoseExtractor(LeafSystem):
+    def __init__(self, plant, panda_id, num_robot_positions):
+        super().__init__()
+        self.plant = plant
+        self.panda_id = panda_id
+        self.num_robot_positions = num_robot_positions
+        self.temp_context = plant.CreateDefaultContext()
+
+        self.DeclareVectorInputPort("joint_positions", size=num_robot_positions * 2)
+        self.DeclareVectorOutputPort("rubber_pad_world_positions", size=3, calc=self.CalcOutput)
+
+        # Cache body selection (best-effort)
+        self._rubber_pad_body_name = None
+        for name in ["rubber_pad", "panda_rubber_pad", "gripper_pad", "panda_hand"]:
+            try:
+                self.plant.GetBodyByName(name)
+                self._rubber_pad_body_name = name
+                break
+            except Exception:
+                continue
+
+        if self._rubber_pad_body_name is None:
+            self._rubber_pad_body_name = "panda_hand"  # last resort
+
+    def CalcOutput(self, context, output):
+        full_state = self.GetInputPort("joint_positions").Eval(context)
+        joint_positions = full_state[:self.num_robot_positions]
+
+        # Update plant positions
+        try:
+            self.plant.SetPositions(self.temp_context, self.panda_id, joint_positions)
+        except Exception:
+            try:
+                self.plant.SetPositions(self.temp_context, joint_positions)
+            except Exception:
+                output.SetFromVector([0.0, 0.0, 0.0])
+                return
+
+        try:
+            body = self.plant.GetBodyByName(self._rubber_pad_body_name)
+            pose = self.plant.EvalBodyPoseInWorld(self.temp_context, body)
+            p = pose.translation()
+            output.SetFromVector([p[0], p[1], p[2]])
+        except Exception:
+            output.SetFromVector([0.0, 0.0, 0.0])
+
 # Add PandaLink7PoseExtractor to the diagram
 panda_link7_extractor = builder.AddNamedSystem("PandaLink7PoseExtractor", 
                                               PandaLink7PoseExtractor(plant, panda_id, num_robot_positions))
@@ -705,6 +892,18 @@ builder.Connect(plant.get_state_output_port(panda_id),
 
 # Add logger for panda_link7 world positions from extractor
 logger_panda_link7_world = LogVectorOutput(panda_link7_extractor.GetOutputPort("panda_link7_world_positions"), builder)
+
+# Add RubberPadPoseExtractor to the diagram and logger
+rubber_pad_extractor = builder.AddNamedSystem(
+    "RubberPadPoseExtractor", RubberPadPoseExtractor(plant, panda_id, num_robot_positions)
+)
+builder.Connect(
+    plant.get_state_output_port(panda_id),
+    rubber_pad_extractor.GetInputPort("joint_positions"),
+)
+logger_rubber_pad_world = LogVectorOutput(
+    rubber_pad_extractor.GetOutputPort("rubber_pad_world_positions"), builder
+)
 
 # Add binary contact detector using Drake's built-in contact detection
 class ContactDetectorForIntegrator(LeafSystem):
@@ -1059,9 +1258,11 @@ log_tau = logger_tau.FindLog(diagram_context)
 log_qv = logger_qv.FindLog(diagram_context)
 log_qr = logger_qr.FindLog(diagram_context)
 log_box_pos = logger_box_pos.FindLog(diagram_context)
+log_box_pos_used_erg = logger_box_pos_used_erg.FindLog(diagram_context)
 log_energy = logger_energy.FindLog(diagram_context)
 log_contact_forces = logger_contact_forces.FindLog(diagram_context)
 log_panda_link7_world = logger_panda_link7_world.FindLog(diagram_context)
+log_rubber_pad_world = logger_rubber_pad_world.FindLog(diagram_context)
 log_z_integrated = logger_z_integrated.FindLog(diagram_context)
 log_contact_flag = logger_contact_flag.FindLog(diagram_context)
 
@@ -1092,9 +1293,11 @@ data_tau = log_tau.data().transpose()  # Selecting only the first 7 columns (joi
 data_qv = log_qv.data().transpose()  # Selecting only the first 7 columns (joints)
 data_qr = log_qr.data().transpose()  # Selecting only the first 7 columns (joints)
 data_box_pos = log_box_pos.data().transpose() # box position
+data_box_pos_used_erg = log_box_pos_used_erg.data().transpose()  # box position as seen inside ERG (shifted)
 data_energy = log_energy.data().transpose() # system energy
 data_contact_forces = log_contact_forces.data().transpose() # contact forces
 data_panda_link7_world = log_panda_link7_world.data().transpose() # panda_link7 world positions
+data_rubber_pad_world = log_rubber_pad_world.data().transpose() # rubber_pad world positions
 data_z_integrated = log_z_integrated.data().transpose() # Z-axis integrator output
 data_contact_flag = log_contact_flag.data().transpose() # contact flag (1 when contact, 0 when no contact)
 
@@ -1297,6 +1500,48 @@ axs_box_poses[2].set_ylabel('Z Position [m]')
 axs_box_poses[2].set_xlabel('Time [s]')
 
 for ax in axs_box_poses:
+    ax.grid(True)
+    ax.legend(loc='upper right')
+    ax.set_xlim([t_time[1], t_time[-1]])
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# Plot box position as seen inside Trajectory ERG (shifted X, same vector passed into trajERG)
+fig_box_seen_erg, axs_box_seen_erg = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+fig_box_seen_erg.suptitle('Box Position Used Inside Trajectory ERG (XYZ)')
+
+axs_box_seen_erg[0].plot(t_time, data_box_pos_used_erg[:, 0], label='Box X (ERG)', linestyle='-', color='red')
+axs_box_seen_erg[1].plot(t_time, data_box_pos_used_erg[:, 1], label='Box Y (ERG)', linestyle='-', color='green')
+axs_box_seen_erg[2].plot(t_time, data_box_pos_used_erg[:, 2], label='Box Z (ERG)', linestyle='-', color='blue')
+
+axs_box_seen_erg[0].set_ylabel('X [m]')
+axs_box_seen_erg[1].set_ylabel('Y [m]')
+axs_box_seen_erg[2].set_ylabel('Z [m]')
+axs_box_seen_erg[2].set_xlabel('Time [s]')
+
+for ax in axs_box_seen_erg:
+    ax.grid(True)
+    ax.legend(loc='upper right')
+    ax.set_xlim([t_time[1], t_time[-1]])
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# Plot rubber_pad world position
+fig_rubber_pad, axs_rubber_pad = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+fig_rubber_pad.suptitle('Rubber Pad World Position (XYZ)')
+
+axs_rubber_pad[0].plot(t_time, data_rubber_pad_world[:, 0], label='rubber_pad X', linestyle='-', color='red')
+axs_rubber_pad[1].plot(t_time, data_rubber_pad_world[:, 1], label='rubber_pad Y', linestyle='-', color='green')
+axs_rubber_pad[2].plot(t_time, data_rubber_pad_world[:, 2], label='rubber_pad Z', linestyle='-', color='blue')
+
+axs_rubber_pad[0].set_ylabel('X [m]')
+axs_rubber_pad[1].set_ylabel('Y [m]')
+axs_rubber_pad[2].set_ylabel('Z [m]')
+axs_rubber_pad[2].set_xlabel('Time [s]')
+
+for ax in axs_rubber_pad:
     ax.grid(True)
     ax.legend(loc='upper right')
     ax.set_xlim([t_time[1], t_time[-1]])
