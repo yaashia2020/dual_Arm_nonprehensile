@@ -1079,7 +1079,7 @@ z_integrator = builder.AddNamedSystem("ZAxisIntegrator",
                                      make_integrate_z_two_in_block(
                                          Ki_z=0.7,  # Integral gain for Z (reduced for stability)
                                          z_min=-0.5,  # Minimum Z limit
-                                         z_max=0.2,   # Maximum Z limit
+                                         z_max=5.0,   # Maximum Z limit
                                          Kaw_z=0.1,   # Anti-windup gain
                                          error_mode="a_minus_b",  # a.z - b.z
                                          passthrough_xy_from="a",  # Use X,Y from first input
