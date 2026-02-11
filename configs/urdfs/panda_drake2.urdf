@@ -11,7 +11,7 @@
   <joint name="robot_to_world" type="fixed">
     <parent link="world"/>
     <child link="panda_link0"/>
-    <origin rpy="0.0 0.0 3.14" xyz="-0.5 0.0 0.0"/>
+    <origin rpy="0.0 0.0 3.14159" xyz="0.5 0.0 0.0"/>
   </joint>
   <link name="panda_link0">
     <inertial>

@@ -55,18 +55,31 @@ class PD_gravity(LeafSystem):
         
         self.plant = plant
         self.robot_id = robot_id
-        self.Kp_ = Kp
-        self.Kd_ = Kd
+        self.Kp_ = np.asarray(Kp, dtype=float).reshape(-1)
+        self.Kd_ = np.asarray(Kd, dtype=float).reshape(-1)
+
+        if self.robot_id is None:
+            raise ValueError("PD_gravity requires robot_id (ModelInstanceIndex).")
+
+        # Per-robot dimensions
+        self.nq = int(self.plant.num_positions(self.robot_id))
+        self.nv = int(self.plant.num_velocities(self.robot_id))
+        self.nu = int(self.plant.get_actuation_input_port(self.robot_id).size())
+
+        if self.nu != self.nq:
+            raise ValueError(f"Expected nu == nq for PD, got nu={self.nu}, nq={self.nq}")
+        if self.Kp_.shape[0] != self.nq or self.Kd_.shape[0] != self.nq:
+            raise ValueError(f"PD gains must have shape ({self.nq},); got Kp={self.Kp_.shape}, Kd={self.Kd_.shape}")
         
-        # Input ports - match original design: 9 joints for desired, 18 for current state
-        self._desired_state_port = self.DeclareVectorInputPort(name="Desired_state", size=7)  # 9 joints (7 arm + 2 gripper)
-        self._current_state_port = self.DeclareVectorInputPort(name="Current_state", size=14)  # 9 pos + 9 vel
+        # Input ports
+        self._desired_state_port = self.DeclareVectorInputPort(name="Desired_state", size=self.nq)
+        self._current_state_port = self.DeclareVectorInputPort(name="Current_state", size=self.nq + self.nv)
         
-        # Output port for control torques - 9 joints
-        self.DeclareVectorOutputPort("tau_u", size=7, calc=self._calc_output)
+        # Output port for control torques
+        self.DeclareVectorOutputPort("tau_u", size=self.nu, calc=self._calc_output)
         
-        # Declare discrete state for storing computed torques - 9 joints
-        self.DeclareDiscreteState(7)
+        # Declare discrete state for storing computed torques
+        self.DeclareDiscreteState(self.nu)
         
         # Periodic update event
         self.DeclarePeriodicDiscreteUpdateEvent(
@@ -83,57 +96,30 @@ class PD_gravity(LeafSystem):
     def _update_discrete_state(self, context, discrete_state):
         """Update the discrete state with new control torques."""
         # Get input values
-        q_d = self._desired_state_port.Eval(context)  # 9 joints
-        q_full = self._current_state_port.Eval(context)  # 18 states (9 pos + 9 vel)
+        q_d = self._desired_state_port.Eval(context)
+        q_full = self._current_state_port.Eval(context)
         
         # Extract position and velocity
-        q = q_full[:7]   # First 9 elements are positions
-        q_dot = q_full[7:14]  # Last 9 elements are velocities
+        q = q_full[: self.nq]
+        q_dot = q_full[self.nq : self.nq + self.nv]
         
         # Create plant context for gravity calculation
         plant_context = self.plant.CreateDefaultContext()
         
         # Set robot state in plant context
-        if self.robot_id is not None:
-            # For dual robot setup, we need to set the state for the specific robot
-            # First get the current full plant state
-            full_state = self.plant.GetPositionsAndVelocities(plant_context)
-            
-            # Calculate the starting index for this robot in the full state vector
-            # This assumes robots are added sequentially to the plant
-            if self.robot_id == self.plant.GetModelInstanceByName("panda"):
-                # First robot - start from beginning
-                start_idx = 0
-            elif self.robot_id == self.plant.GetModelInstanceByName("panda_1"):
-                # Second robot - start after first robot's states
-                start_idx = 14  # First robot has 18 states (9 pos + 9 vel)
-            else:
-                # Fallback - assume first 9 elements
-                start_idx = 0
-            
-            # Set the state for this specific robot
-            robot_state = q_full[:7]  # Just the 9 joint positions for robot
-            self.plant.SetPositions(plant_context, self.robot_id, robot_state)
+        self.plant.SetPositions(plant_context, self.robot_id, q)
         
-        # Calculate gravity compensation
-        gravity_full = -self.plant.CalcGravityGeneralizedForces(plant_context)
-        gravity_full_np = np.array(gravity_full).flatten()
-        
-        # Extract gravity for this robot
-        if self.robot_id is not None:
-            # Get the starting index for this robot's gravity forces
-            if self.robot_id == self.plant.GetModelInstanceByName("panda"):
-                # First robot - first 9 elements
-                gravity = gravity_full_np[:7]
-            elif self.robot_id == self.plant.GetModelInstanceByName("panda_1"):
-                # Second robot - elements after first robot
-                gravity = gravity_full_np[7:14]  # Assuming 9 joints per robot
-            else:
-                # Fallback
-                gravity = gravity_full_np[:7]
-        else:
-            # Assume first 9 elements for backward compatibility
-            gravity = gravity_full_np[:7]
+        # Calculate gravity generalized forces for the *whole plant*.
+        # NOTE: CalcGravityGeneralizedForces returns a vector indexed like generalized velocities (size = plant.num_velocities()).
+        tau_g_full = -self.plant.CalcGravityGeneralizedForces(plant_context)
+        tau_g_full = np.asarray(tau_g_full).reshape(-1)
+
+        # Extract this model instance's slice from any nv-indexed array.
+        # Drake exposes this slicing helper as GetVelocitiesFromArray(model_instance, array),
+        # so we reuse it here because generalized forces share the same indexing as v.
+        tau_g_model = np.asarray(self.plant.GetVelocitiesFromArray(self.robot_id, tau_g_full), dtype=float).reshape(-1)
+        # PD is defined over positions; in most robot arms nv == nq. Keep a defensive trim if not.
+        gravity = tau_g_model[: self.nq]
         
         # Calculate PD control torques
         tau = self.Kp_ * (q_d - q) - self.Kd_ * q_dot
@@ -231,7 +217,9 @@ discrete_solver = DiscreteContactApproximation.kSap # Options:kTamsi, kSap, kLag
 realtime_factor = 1  # Real-time factor for simulation speed
 time_step = 0.0005
 
-meshcat_visualisation = True
+# Visualization can fail in headless / restricted network environments.
+# Use MESHCAT_VIS=0 to disable it without editing the file.
+meshcat_visualisation = os.environ.get("MESHCAT_VIS", "1") not in ("0", "false", "False")
 simulate = True
 
 # Create system diagram
@@ -258,36 +246,66 @@ print(f"Movable box ID: {movable_box_id}")
 #              ##################ERG System################
 ######################################################################################################
 class ERG(LeafSystem):
-    def __init__(self):
+    def __init__(self, plant, robot_id, erg_name="erg"):
         super().__init__()  # Don't forget to initialize the base class.
-        self._state_port = self.DeclareVectorInputPort(name="state", size=14)
-        self._tau_port = self.DeclareVectorInputPort(name="tau", size=7)
-        self._qr_port = self.DeclareVectorInputPort(name="q_r", size=7)  # Back to 9 joints
+        self.plant = plant
+        self.robot_id = robot_id
+        self.erg_name = erg_name
+        self.nq = int(self.plant.num_positions(self.robot_id))
+        self.nv = int(self.plant.num_velocities(self.robot_id))
+        self.nu = int(self.plant.get_actuation_input_port(self.robot_id).size())
+        if self.nu != self.nq:
+            raise ValueError(f"[{erg_name}] expected nu == nq, got nu={self.nu}, nq={self.nq}")
+
+        self._state_port = self.DeclareVectorInputPort(name="state", size=self.nq + self.nv)
+        self._tau_port = self.DeclareVectorInputPort(name="tau", size=self.nu)
+        self._qr_port = self.DeclareVectorInputPort(name="q_r", size=self.nq)
         self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
 
-        state_index = self.DeclareDiscreteState(7)  # Back to 9 joints
+        # Discrete state stores q_v (the filtered reference). Default zeros, but we will
+        # set it from the connected plant state at Simulator.Initialize().
+        state_index = self.DeclareDiscreteState(self.nq)
         self.DeclareStateOutputPort("q_v_filtered", state_index)  # One output: y=x.
         
         # Add output port for calculated energy
         self.DeclareVectorOutputPort("calculated_energy", size=1, calc=self.output_energy)
+        self.DeclareVectorOutputPort("dsm", size=1, calc=self.output_dsm)
         
         self.DeclarePeriodicDiscreteUpdateEvent(
             period_sec=0.01,  # time step.
             offset_sec=0.0,  # The first event is at time zero.
             update=self.refrence) # Call the Update method defined below.
+
+        # At initialization, sync q_v to the robot's actual initial joint positions so the controller
+        # does not see q_v_filtered = 0 at t=0.
+        self.DeclareInitializationDiscreteUpdateEvent(self._initialize_qv)
         self.erg = ExplicitReferenceGovernor(
             robust_delta_tau_=0.1, kappa_tau_=1.0,
             robust_delta_q_=0.1, kappa_q_=15.0, robust_delta_dq_=0.1, kappa_dq_=7.0,
-            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0)
+            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0,
+            name=erg_name)
 
         # Initialize a flag to check if it's the first update
         self.first_update = True
+        self.q_v_ = np.zeros(self.nq)
+        # Debug option: breaking in a LeafSystem update will halt the whole simulation.
+        self.break_on_dsm_zero = False
+    
+    def _initialize_qv(self, context, discrete_state):
+        """Initialize q_v from the measured robot joint positions at t=0."""
+        state = self._state_port.Eval(context)
+        q = np.asarray(state[: self.nq], dtype=float)
+        self.q_v_ = q.copy()
+        # Write into discrete state so output port is correct immediately.
+        discrete_state.get_mutable_vector().SetFromVector(self.q_v_)
+        # No need to re-init again in the first periodic callback.
+        self.first_update = False
 
     def refrence(self, context, discrete_state):
         # Evaluate the input ports
         state = self._state_port.Eval(context)
-        q = state[:7]  # First 7 elements are positions
-        dq = state[7:14]  # Last 7 elements are velocities
+        q = state[: self.nq]
+        dq = state[self.nq : self.nq + self.nv]
         tau = self._tau_port.Eval(context)
         q_r = self._qr_port.Eval(context)
         box_state = self._box_state_port.Eval(context)
@@ -300,7 +318,7 @@ class ERG(LeafSystem):
         if self.first_update:
             #self.q_v_ = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]  # Use all 9 joints
             #self.q_v_ = [np.pi / 2, -np.pi / 4, 0, -3 * np.pi / 4, np.pi / 2, np.pi / 2, -np.pi / 4]
-            q = state[:7]  # take current robot positions from input port
+            q = state[: self.nq]
             self.q_v_ = q.copy()  # sync ERG’s internal reference to reality
             self.first_update = False
 
@@ -311,6 +329,10 @@ class ERG(LeafSystem):
         
         # Calculate energy from trajectory predictions
         self.calculated_energy = self.erg.get_energy(q, dq, tau, q_r, self.q_v_, box_position)
+        self.current_dsm = self.erg.get_last_dsm()
+        if self.break_on_dsm_zero and np.isclose(self.current_dsm, 0.0):
+            print(f"[DSM breakpoint][{self.erg_name}] t={context.get_time():.4f}, dsm={self.current_dsm:.6f}")
+            breakpoint()
 
         # Write into the output vector.
         discrete_state.get_mutable_vector().SetFromVector(self.q_v_)
@@ -322,23 +344,40 @@ class ERG(LeafSystem):
         else:
             output.SetAtIndex(0, 0.0)
 
+    def output_dsm(self, context, output):
+        # Return latest DSM from trajectoryERG.
+        if hasattr(self, 'current_dsm'):
+            output.SetAtIndex(0, self.current_dsm)
+        else:
+            output.SetAtIndex(0, 0.0)
+
 ######################################################################################################
 #              ##################Relaxed IK System for Box Tracking################
 ######################################################################################################
 class DualRelaxedIKBoxTracker(LeafSystem):
-    def __init__(self, plant, plant_context):
+    def __init__(self, plant, plant_context, panda1_id, panda2_id):
         super().__init__()
 
         # Store plant and context
         self.plant = plant
         self.plant_context = plant_context
+        self.panda1_id = panda1_id
+        self.panda2_id = panda2_id
+        self.nq1 = int(self.plant.num_positions(self.panda1_id))
+        self.nq2 = int(self.plant.num_positions(self.panda2_id))
 
         # Input port for box state
         self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
 
-        # State for both robots (7 + 7 joints)
-        state_index = self.DeclareDiscreteState(14)
+        # State for both robots (q1 + q2)
+        state_index = self.DeclareDiscreteState(self.nq1 + self.nq2)
         self.DeclareStateOutputPort("ik_joint_targets", state_index)
+
+        # Output port for the cartesian targets that IK is solving for:
+        # [x1, y1, z1, x2, y2, z2]
+        self.DeclareVectorOutputPort(
+            "ee_target_positions", size=6, calc=self.CalcTargetPositions
+        )
 
         # Periodic update for IK solving
         self.DeclarePeriodicDiscreteUpdateEvent(
@@ -392,6 +431,37 @@ class DualRelaxedIKBoxTracker(LeafSystem):
         # IK tolerances
         self.tolerance = [0.01, 0.01, 0.01, 0.1, 0.1, 0.1]
 
+    def CalcTargetPositions(self, context, output):
+        """Compute the same EE xyz targets used by solve_ik()."""
+        box_state = self._box_state_port.Eval(context)
+        x_b, y_b, z_b = box_state[4:7]
+        t = context.get_time()
+
+        box_size = np.array([0.22, 0.30, 0.20])  # from movable_box.sdf
+        half_extents = box_size / 2.0
+        pad_offset = 0.03
+
+        z_target = z_b
+        if t > 6.0:
+            z_target = z_b + 0.4
+
+        target_position1 = [x_b - half_extents[0] - pad_offset, y_b, z_target]
+        target_position2 = [x_b + half_extents[0] + pad_offset, y_b, z_target]
+
+        output.SetFromVector(
+            np.array(
+                [
+                    target_position1[0],
+                    target_position1[1],
+                    target_position1[2],
+                    target_position2[0],
+                    target_position2[1],
+                    target_position2[2],
+                ],
+                dtype=float,
+            )
+        )
+
     def solve_ik(self, context, discrete_state):
         """Solve IK for both robots to grab the box from opposite sides."""
         if not self.ik_available:
@@ -434,6 +504,13 @@ class DualRelaxedIKBoxTracker(LeafSystem):
             q1_solution = self.rik1.solve_position(target_position1, orientation1, self.tolerance)
             q2_solution = self.rik2.solve_position(target_position2, orientation2, self.tolerance)
 
+            q1_solution = np.asarray(q1_solution, dtype=float).reshape(-1)
+            q2_solution = np.asarray(q2_solution, dtype=float).reshape(-1)
+            if q1_solution.shape[0] != self.nq1 or q2_solution.shape[0] != self.nq2:
+                raise ValueError(
+                    f"IK returned shapes q1={q1_solution.shape}, q2={q2_solution.shape}, "
+                    f"expected ({self.nq1},) and ({self.nq2},)"
+                )
             solution = np.concatenate([q1_solution, q2_solution])
             current_state.SetFromVector(solution)
 
@@ -515,13 +592,18 @@ class DualPandaLink7PoseExtractor(LeafSystem):
         self.plant = plant
         self.panda1_id = panda1_id
         self.panda2_id = panda2_id
+        self.nq1 = int(self.plant.num_positions(self.panda1_id))
+        self.nv1 = int(self.plant.num_velocities(self.panda1_id))
+        self.nq2 = int(self.plant.num_positions(self.panda2_id))
+        self.nv2 = int(self.plant.num_velocities(self.panda2_id))
         
         # Input ports for both robots
-        self.DeclareVectorInputPort("robot1_joint_positions", size=14)
-        self.DeclareVectorInputPort("robot2_joint_positions", size=14)
+        self.DeclareVectorInputPort("robot1_joint_positions", size=self.nq1 + self.nv1)
+        self.DeclareVectorInputPort("robot2_joint_positions", size=self.nq2 + self.nv2)
         
         # Output ports for both robots (6 values: [robot1_x, robot1_y, robot1_z, robot2_x, robot2_y, robot2_z])
         self.DeclareVectorOutputPort("panda_link7_world_positions", size=6, calc=self.CalcOutput)
+        self.DeclareVectorOutputPort("rubber_pad_world_positions", size=6, calc=self.CalcRubberPadOutput)
         
         self.temp_context = plant.CreateDefaultContext()
     
@@ -530,9 +612,9 @@ class DualPandaLink7PoseExtractor(LeafSystem):
         robot1_state = self.GetInputPort("robot1_joint_positions").Eval(context)
         robot2_state = self.GetInputPort("robot2_joint_positions").Eval(context)
         
-        # Extract joint positions (first 9 values)
-        robot1_joints = robot1_state[:7]
-        robot2_joints = robot2_state[:7]
+        # Extract joint positions
+        robot1_joints = robot1_state[: self.nq1]
+        robot2_joints = robot2_state[: self.nq2]
         
         # Set positions for robot 1
         self.plant.SetPositions(self.temp_context, self.panda1_id, robot1_joints)
@@ -550,6 +632,39 @@ class DualPandaLink7PoseExtractor(LeafSystem):
         combined_translation = np.concatenate([robot1_translation, robot2_translation])
         output.SetFromVector([combined_translation[0], combined_translation[1], combined_translation[2],
                              combined_translation[3], combined_translation[4], combined_translation[5]])
+
+    def CalcRubberPadOutput(self, context, output):
+        # Get joint positions for both robots
+        robot1_state = self.GetInputPort("robot1_joint_positions").Eval(context)
+        robot2_state = self.GetInputPort("robot2_joint_positions").Eval(context)
+
+        # Extract joint positions
+        robot1_joints = robot1_state[: self.nq1]
+        robot2_joints = robot2_state[: self.nq2]
+
+        # Set positions for robot 1
+        self.plant.SetPositions(self.temp_context, self.panda1_id, robot1_joints)
+        panda1_pad_body = self.plant.GetBodyByName("rubber_pad", self.panda1_id)
+        panda1_pad_pose = self.plant.EvalBodyPoseInWorld(self.temp_context, panda1_pad_body)
+        robot1_translation = panda1_pad_pose.translation()
+
+        # Set positions for robot 2
+        self.plant.SetPositions(self.temp_context, self.panda2_id, robot2_joints)
+        panda2_pad_body = self.plant.GetBodyByName("rubber_pad", self.panda2_id)
+        panda2_pad_pose = self.plant.EvalBodyPoseInWorld(self.temp_context, panda2_pad_body)
+        robot2_translation = panda2_pad_pose.translation()
+
+        combined_translation = np.concatenate([robot1_translation, robot2_translation])
+        output.SetFromVector(
+            [
+                combined_translation[0],
+                combined_translation[1],
+                combined_translation[2],
+                combined_translation[3],
+                combined_translation[4],
+                combined_translation[5],
+            ]
+        )
 
 ######################################################################################################
 #              ##################Robot Link Index Accessor################
@@ -635,29 +750,31 @@ class RobotLinkIndexAccessor(LeafSystem):
 
 # Create a simple system to split IK output for dual robots
 class IKSplitter(LeafSystem):
-    def __init__(self):
+    def __init__(self, nq1, nq2):
         super().__init__()
-        self.DeclareVectorInputPort("ik_joint_targets", size=14)  # Full IK output
-        self.DeclareVectorOutputPort("robot1_targets", size=7, calc=self.CalcRobot1Output)
-        self.DeclareVectorOutputPort("robot2_targets", size=7, calc=self.CalcRobot2Output)
+        self.nq1 = int(nq1)
+        self.nq2 = int(nq2)
+        self.DeclareVectorInputPort("ik_joint_targets", size=self.nq1 + self.nq2)  # Full IK output
+        self.DeclareVectorOutputPort("robot1_targets", size=self.nq1, calc=self.CalcRobot1Output)
+        self.DeclareVectorOutputPort("robot2_targets", size=self.nq2, calc=self.CalcRobot2Output)
     
     def CalcRobot1Output(self, context, output):
         full_targets = self.GetInputPort("ik_joint_targets").Eval(context)
-        robot1_targets = full_targets[:7]  # First 9 elements for robot 1
+        robot1_targets = full_targets[: self.nq1]
         output.SetFromVector(robot1_targets)
     
     def CalcRobot2Output(self, context, output):
         full_targets = self.GetInputPort("ik_joint_targets").Eval(context)
-        robot2_targets = full_targets[7:14]  # Last 9 elements for robot 2
+        robot2_targets = full_targets[self.nq1 : self.nq1 + self.nq2]
         output.SetFromVector(robot2_targets)
 
 # Add all systems to the diagram
-dual_ik_tracker = builder.AddSystem(DualRelaxedIKBoxTracker(plant, plant_context))
-ik_splitter = builder.AddSystem(IKSplitter())
+dual_ik_tracker = builder.AddSystem(DualRelaxedIKBoxTracker(plant, plant_context, panda1_id, panda2_id))
+ik_splitter = builder.AddSystem(IKSplitter(num_positions_1, num_positions_2))
 
-# Create two separate ERG systems (one for each robot) following test_erg.py pattern
-erg1 = builder.AddSystem(ERG())
-erg2 = builder.AddSystem(ERG())
+# Create two separate ERG systems (one for each robot)
+erg1 = builder.AddSystem(ERG(plant, panda1_id, "robot1"))
+erg2 = builder.AddSystem(ERG(plant, panda2_id, "robot2"))
 
 dual_contact_converter = builder.AddSystem(DualContactForceConverter(plant, scene_graph, panda1_id, panda2_id))
 dual_pose_extractor = builder.AddSystem(DualPandaLink7PoseExtractor(plant, panda1_id, panda2_id))
@@ -668,11 +785,20 @@ fcl_robot1 = builder.AddSystem(FCLLinkDistanceSystem(plant, panda1_id, movable_b
 fcl_robot2 = builder.AddSystem(FCLLinkDistanceSystem(plant, panda2_id, movable_box_id))
 
 
-# Add PID controllers for both robots
-Kp1 = 15 * np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0])  # 7 joints
-Kd1 = 10 * np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0])  # 7 joints
-Kp2 = 15 * np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0])  # 9 joints
-Kd2 = 10 * np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0])  # 9 joints
+# Add PD(+G) controllers for both robots
+if num_positions_1 == 7:
+    Kp1 = np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0])
+    Kd1 = np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0])
+else:
+    Kp1 = np.full(num_positions_1, 100.0)
+    Kd1 = np.full(num_positions_1, 5.0)
+
+if num_positions_2 == 7:
+    Kp2 = np.array([120.0, 120.0, 120.0, 100.0, 50.0, 45.0, 15.0])
+    Kd2 = np.array([8.0, 8.0, 8.0, 5.0, 2.0, 2.0, 1.0])
+else:
+    Kp2 = np.full(num_positions_2, 100.0)
+    Kd2 = np.full(num_positions_2, 5.0)
 
 controller1 = builder.AddNamedSystem("PD+G controller 1", PD_gravity(plant, Kp1, Kd1, panda1_id))
 controller2 = builder.AddNamedSystem("PD+G controller 2", PD_gravity(plant, Kp2, Kd2, panda2_id))
@@ -692,6 +818,16 @@ erg_logger1 = LogVectorOutput(erg1.GetOutputPort("q_v_filtered"), builder)
 erg_logger1.set_name("erg_logger1")
 erg_logger2 = LogVectorOutput(erg2.GetOutputPort("q_v_filtered"), builder)
 erg_logger2.set_name("erg_logger2")
+erg_dsm_logger1 = LogVectorOutput(erg1.GetOutputPort("dsm"), builder)
+erg_dsm_logger1.set_name("erg_dsm_logger1")
+erg_dsm_logger2 = LogVectorOutput(erg2.GetOutputPort("dsm"), builder)
+erg_dsm_logger2.set_name("erg_dsm_logger2")
+ik_target_xyz_logger = LogVectorOutput(dual_ik_tracker.GetOutputPort("ee_target_positions"), builder)
+ik_target_xyz_logger.set_name("ik_target_xyz_logger")
+ik_ref_logger1 = LogVectorOutput(ik_splitter.GetOutputPort("robot1_targets"), builder)
+ik_ref_logger1.set_name("ik_ref_logger1")
+ik_ref_logger2 = LogVectorOutput(ik_splitter.GetOutputPort("robot2_targets"), builder)
+ik_ref_logger2.set_name("ik_ref_logger2")
 
 box_pos_logger = LogVectorOutput(plant.get_state_output_port(movable_box_id), builder)
 box_pos_logger.set_name("box_pos_logger")
@@ -701,6 +837,8 @@ contact_logger.set_name("contact_logger")
 
 pose_logger = LogVectorOutput(dual_pose_extractor.GetOutputPort("panda_link7_world_positions"), builder)
 pose_logger.set_name("pose_logger")
+rpad_logger = LogVectorOutput(dual_pose_extractor.GetOutputPort("rubber_pad_world_positions"), builder)
+rpad_logger.set_name("rpad_logger")
 
 link_index_logger = LogVectorOutput(link_index_accessor.GetOutputPort("link7_indexes"), builder)
 link_index_logger.set_name("link_index_logger")
@@ -760,7 +898,8 @@ builder.Connect(plant.get_state_output_port(), fcl_robot2.GetInputPort("x"))
 
 
 # Add visualization
-AddDefaultVisualization(builder=builder)
+if meshcat_visualisation:
+    AddDefaultVisualization(builder=builder)
 
 # Build the diagram
 diagram = builder.Build()
@@ -772,7 +911,8 @@ simulator.Initialize()
 
 # Run simulation
 print("Starting dual robot simulation...")
-simulator.AdvanceTo(10.0)
+sim_duration = float(os.environ.get("SIM_DURATION", "10.0"))
+simulator.AdvanceTo(sim_duration)
 
 print("Simulation completed!")
 
@@ -784,9 +924,15 @@ log_tau1 = tau_logger1.FindLog(diagram_context)
 log_tau2 = tau_logger2.FindLog(diagram_context)
 log_erg1 = erg_logger1.FindLog(diagram_context)
 log_erg2 = erg_logger2.FindLog(diagram_context)
+log_dsm1 = erg_dsm_logger1.FindLog(diagram_context)
+log_dsm2 = erg_dsm_logger2.FindLog(diagram_context)
+log_ik_target_xyz = ik_target_xyz_logger.FindLog(diagram_context)
+log_ik_ref1 = ik_ref_logger1.FindLog(diagram_context)
+log_ik_ref2 = ik_ref_logger2.FindLog(diagram_context)
 log_box = box_pos_logger.FindLog(diagram_context)
 log_contact = contact_logger.FindLog(diagram_context)
 log_pose = pose_logger.FindLog(diagram_context)
+log_rpad = rpad_logger.FindLog(diagram_context)
 log_fcl1 = fcl_logger1.FindLog(diagram_context)
 log_fcl2 = fcl_logger2.FindLog(diagram_context)
 
@@ -807,6 +953,22 @@ data_tau2 = log_tau2.data().transpose()
 # Extract ERG outputs for both robots
 data_erg1 = log_erg1.data().transpose()
 data_erg2 = log_erg2.data().transpose()
+t_erg1 = log_erg1.sample_times()
+t_erg2 = log_erg2.sample_times()
+data_dsm1 = log_dsm1.data().transpose()[:, 0]
+data_dsm2 = log_dsm2.data().transpose()[:, 0]
+t_dsm1 = log_dsm1.sample_times()
+t_dsm2 = log_dsm2.sample_times()
+
+# Extract IK cartesian xyz targets for both robots
+data_ik_target_xyz = log_ik_target_xyz.data().transpose()  # shape: (N, 6)
+t_ik_target_xyz = log_ik_target_xyz.sample_times()
+
+# Extract RelaxedIK references (q_r) for both robots
+data_ik_ref1 = log_ik_ref1.data().transpose()
+data_ik_ref2 = log_ik_ref2.data().transpose()
+t_ik_ref1 = log_ik_ref1.sample_times()
+t_ik_ref2 = log_ik_ref2.sample_times()
 
 # Extract box position data
 data_box_pos = log_box.data().transpose()
@@ -816,6 +978,10 @@ data_contact_forces = log_contact.data().transpose()
 
 # Extract pose data for both robots
 data_pose = log_pose.data().transpose()
+
+# Extract rubber_pad xyz data for both robots
+data_rpad = log_rpad.data().transpose()  # shape: (N, 6)
+t_rpad = log_rpad.sample_times()
 
 # Extract FCL distance data for both robots
 data_fcl1 = log_fcl1.data().transpose()  # Robot 1 FCL distances (4 links)
@@ -830,6 +996,24 @@ print(f"Box final position: {data_box_pos[-1, 4:7]}")  # x, y, z position
 print(f"Final contact forces - Robot 1: {data_contact_forces[-1, :3]}, Robot 2: {data_contact_forces[-1, 3:6]}")
 print(f"Final FCL distances - Robot 1: {data_fcl1[-1, :]} (link7, hand, leftfinger, rightfinger)")
 print(f"Final FCL distances - Robot 2: {data_fcl2[-1, :]} (link7, hand, leftfinger, rightfinger)")
+print(f"Final DSM - Robot 1: {data_dsm1[-1]:.4f}, Robot 2: {data_dsm2[-1]:.4f}")
+
+# Extract final rubber_pad poses (position + orientation) for both robots.
+plant_context_final = plant.GetMyContextFromRoot(diagram_context)
+robot1_pad_pose = plant.EvalBodyPoseInWorld(
+    plant_context_final, plant.GetBodyByName("rubber_pad", panda1_id)
+)
+robot2_pad_pose = plant.EvalBodyPoseInWorld(
+    plant_context_final, plant.GetBodyByName("rubber_pad", panda2_id)
+)
+
+robot1_pad_pos = robot1_pad_pose.translation()
+robot2_pad_pos = robot2_pad_pose.translation()
+
+print(f"Robot 1 final rubber_pad position: {robot1_pad_pos}")
+print(f"Robot 2 final rubber_pad position: {robot2_pad_pos}")
+print(f"Robot 1 final rubber_pad quaternion [w, x, y, z]: {robot1_pad_pose.rotation().ToQuaternion().wxyz()}")
+print(f"Robot 2 final rubber_pad quaternion [w, x, y, z]: {robot2_pad_pose.rotation().ToQuaternion().wxyz()}")
 
 
 # Create plots for both robots
@@ -938,6 +1122,100 @@ plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
+
+# Plot joint-level comparison: Actual q vs ERG command vs RelaxedIK reference.
+joint_limits_lower = np.zeros(7)
+joint_limits_upper = np.zeros(7)
+try:
+    for j in range(7):
+        joint_name = f"panda_joint{j+1}"
+        joint = plant.GetJointByName(joint_name, panda1_id)
+        joint_limits_lower[j] = joint.position_lower_limits()[0]
+        joint_limits_upper[j] = joint.position_upper_limits()[0]
+except Exception as e:
+    print(f"Could not read joint limits from plant ({e}); using Panda defaults.")
+    joint_limits_lower = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+    joint_limits_upper = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
+
+fig_cmp, axes_cmp = plt.subplots(2, 4, figsize=(18, 8), sharex=True)
+for j in range(7):
+    row = 0 if j < 4 else 1
+    col = j if j < 4 else j - 4
+    ax = axes_cmp[row, col]
+    lim_low = joint_limits_lower[j]
+    lim_high = joint_limits_upper[j]
+    ax.axhspan(
+        lim_low,
+        lim_high,
+        color="0.85",
+        alpha=0.25,
+        label="Joint limits" if j == 0 else None,
+        zorder=0,
+    )
+    ax.axhline(lim_low, color="0.5", linestyle="-.", linewidth=1.0)
+    ax.axhline(lim_high, color="0.5", linestyle="-.", linewidth=1.0)
+    ax.plot(t_time, data_q1[:, j], color="k", linewidth=1.8, label="Robot1 actual q")
+    ax.plot(t_erg1, data_erg1[:, j], color="tab:blue", linestyle="--", linewidth=1.4, label="Robot1 ERG cmd")
+    ax.plot(t_ik_ref1, data_ik_ref1[:, j], color="tab:green", linestyle=":", linewidth=1.4, label="Robot1 RelaxedIK ref")
+    ax.plot(t_time, data_q2[:, j], color="0.45", linewidth=1.8, label="Robot2 actual q")
+    ax.plot(t_erg2, data_erg2[:, j], color="tab:orange", linestyle="--", linewidth=1.4, label="Robot2 ERG cmd")
+    ax.plot(t_ik_ref2, data_ik_ref2[:, j], color="tab:red", linestyle=":", linewidth=1.4, label="Robot2 RelaxedIK ref")
+    ax.set_title(f"Joint {j+1}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Position (rad)")
+    ax.grid(True, alpha=0.3)
+
+# Use last empty subplot for a compact legend.
+axes_cmp[1, 3].axis("off")
+handles, labels = axes_cmp[0, 0].get_legend_handles_labels()
+axes_cmp[1, 3].legend(handles, labels, loc="center", frameon=True)
+fig_cmp.suptitle("Joint Tracking: Actual vs ERG vs RelaxedIK Reference (Both Robots)")
+fig_cmp.tight_layout()
+
+# Plot DSM from trajectoryERG output.
+plt.figure(figsize=(10, 4))
+plt.plot(t_dsm1, data_dsm1, label="Robot 1 DSM", linewidth=2.0)
+plt.plot(t_dsm2, data_dsm2, label="Robot 2 DSM", linewidth=2.0)
+plt.axhline(0.0, color="k", linestyle="--", alpha=0.6, linewidth=1.0)
+plt.title("TrajectoryERG Dynamic Safety Margin (DSM)")
+plt.xlabel("Time (s)")
+plt.ylabel("DSM")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+
+# Compare IK xyz targets vs actual rubber_pad world xyz (both robots).
+fig_xyz_cmp, axes_xyz_cmp = plt.subplots(3, 1, figsize=(11, 7), sharex=True)
+labels = ["X (m)", "Y (m)", "Z (m)"]
+for k in range(3):
+    # Robot 1: target vs actual
+    axes_xyz_cmp[k].plot(
+        t_ik_target_xyz, data_ik_target_xyz[:, k],
+        color="tab:blue", linestyle="--", linewidth=2.0, label="Robot 1 target" if k == 0 else None
+    )
+    axes_xyz_cmp[k].plot(
+        t_rpad, data_rpad[:, k],
+        color="tab:blue", linestyle="-", linewidth=2.0, label="Robot 1 rubber_pad" if k == 0 else None
+    )
+
+    # Robot 2: target vs actual
+    axes_xyz_cmp[k].plot(
+        t_ik_target_xyz, data_ik_target_xyz[:, 3 + k],
+        color="tab:orange", linestyle="--", linewidth=2.0, label="Robot 2 target" if k == 0 else None
+    )
+    axes_xyz_cmp[k].plot(
+        t_rpad, data_rpad[:, 3 + k],
+        color="tab:orange", linestyle="-", linewidth=2.0, label="Robot 2 rubber_pad" if k == 0 else None
+    )
+
+    axes_xyz_cmp[k].set_ylabel(labels[k])
+    axes_xyz_cmp[k].grid(True, alpha=0.3)
+
+axes_xyz_cmp[0].set_title("IK Target XYZ vs rubber_pad XYZ (World)")
+axes_xyz_cmp[-1].set_xlabel("Time (s)")
+axes_xyz_cmp[0].legend()
+fig_xyz_cmp.tight_layout()
+
 plt.show()
 
 
