@@ -5,3 +5,4 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .mypy_cache/
+final_rubber_pad_poses.png
