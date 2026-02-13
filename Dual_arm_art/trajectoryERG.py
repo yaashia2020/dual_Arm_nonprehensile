@@ -452,8 +452,37 @@ class ExplicitReferenceGovernor:
         state = self.plant_context.get_mutable_state()
         discrete_values = state.get_mutable_discrete_state()
         xd = discrete_values.get_mutable_vector()
-        # Set positions to q_v and velocities to zero
-        xd.SetFromVector(np.concatenate([q_v, np.zeros(U)]))
+
+        # Configure plant context to the reference configuration q_v.
+        # Prefer Drake setters; fall back to writing the underlying discrete state vector.
+        q_v_arr = np.asarray(q_v, dtype=float).ravel()
+        nq = int(self.plant_pred.num_positions())
+        nv = int(self.plant_pred.num_velocities())
+        try:
+            q_set = np.zeros(nq, dtype=float)
+            n_fill = int(min(nq, q_v_arr.size))
+            q_set[:n_fill] = q_v_arr[:n_fill]
+            self.plant_pred.SetPositions(self.plant_context, q_set)
+            if nv > 0:
+                self.plant_pred.SetVelocities(self.plant_context, np.zeros(nv, dtype=float))
+        except Exception:
+            # Build x=[q;v] of exactly the BasicVector size to avoid mismatch errors.
+            x_size = int(xd.size())
+            x_qv = np.zeros(x_size, dtype=float)
+
+            # Fill q segment with as much of q_v as fits.
+            q_seg = int(min(nq, x_size))
+            n_fill = int(min(q_seg, q_v_arr.size))
+            x_qv[:n_fill] = q_v_arr[:n_fill]
+
+            # v segment stays zero (if present)
+            if x_size > nq:
+                v_start = int(nq)
+                v_end = int(min(nq + nv, x_size))
+                if v_end > v_start:
+                    x_qv[v_start:v_end] = 0.0
+
+            xd.SetFromVector(x_qv)
         
         # Get link positions and calculate Jacobians using q_v
         link_positions = []

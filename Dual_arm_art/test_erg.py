@@ -77,7 +77,9 @@ discrete_solver = DiscreteContactApproximation.kTamsi # Options:kTamsi, kSap, kL
 realtime_factor = 1  # Real-time factor for simulation speed
 time_step = 0.001
 
-meshcat_visualisation = True
+# Visualization can fail in headless / restricted network environments.
+# Use MESHCAT_VIS=0 to disable it without editing the file.
+meshcat_visualisation = os.environ.get("MESHCAT_VIS", "1") not in ("0", "false", "False")
 simulate = True
 
 # Create system diagram
@@ -211,7 +213,13 @@ class ERG(LeafSystem):
         self.erg = ExplicitReferenceGovernor(
             robust_delta_tau_=0.1, kappa_tau_=1.0,
             robust_delta_q_=0.1, kappa_q_=15.0, robust_delta_dq_=0.1, kappa_dq_=7.0,
-            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0)
+            robust_delta_dp_EE_=0.01, kappa_dp_EE_=7.0, kappa_terminal_energy_=7.5, FD_=1.0,
+            # test_erg uses a 9-DoF Panda model (arm + gripper). Make the ERG prediction plant match.
+            num_joints=9,
+            urdf_path=os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "../models/robots/panda_fr3/urdf/panda_fr3.urdf")
+            ),
+        )
 
         # Initialize a flag to check if it's the first update
         self.first_update = True
