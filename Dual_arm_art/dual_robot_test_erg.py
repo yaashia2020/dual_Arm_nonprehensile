@@ -36,6 +36,9 @@ wrapper_dir = "/home/yaashia/dual_arm_nonprehensile/submodules/relaxed_ik_core/w
 sys.path.insert(0, wrapper_dir)
 from python_wrapper import RelaxedIKRust
 
+# Import Z-axis integrator builder (used for both arms)
+from z_axis_integrator import make_integrate_z_two_in_block
+
 
 
 
@@ -369,6 +372,15 @@ class DualRelaxedIKBoxTracker(LeafSystem):
         # Input port for box state
         self._box_state_port = self.DeclareVectorInputPort(name="box_state", size=13)
 
+        # Optional Z-axis integrator outputs (one per arm). If connected, we use the Z component
+        # as an additional integrated Z offset for each robot's target.
+        self._z_adjusted_target1_port = self.DeclareVectorInputPort(
+            name="z_adjusted_target1", size=3
+        )
+        self._z_adjusted_target2_port = self.DeclareVectorInputPort(
+            name="z_adjusted_target2", size=3
+        )
+
         # State for both robots (q1 + q2)
         state_index = self.DeclareDiscreteState(self.nq1 + self.nq2)
         self.DeclareStateOutputPort("ik_joint_targets", state_index)
@@ -445,8 +457,22 @@ class DualRelaxedIKBoxTracker(LeafSystem):
         if t > 6.0:
             z_target = z_b + 0.4
 
-        target_position1 = [x_b - half_extents[0] - pad_offset, y_b, z_target]
-        target_position2 = [x_b + half_extents[0] + pad_offset, y_b, z_target]
+        # Read optional integrated Z offsets (one per arm)
+        z_off1 = 0.0
+        z_off2 = 0.0
+        try:
+            if self._z_adjusted_target1_port.HasValue(context):
+                z_off1 = float(self._z_adjusted_target1_port.Eval(context)[2])
+        except Exception:
+            pass
+        try:
+            if self._z_adjusted_target2_port.HasValue(context):
+                z_off2 = float(self._z_adjusted_target2_port.Eval(context)[2])
+        except Exception:
+            pass
+
+        target_position1 = [x_b - half_extents[0] - pad_offset, y_b, z_target + z_off1]
+        target_position2 = [x_b + half_extents[0] + pad_offset, y_b, z_target + z_off2]
 
         output.SetFromVector(
             np.array(
@@ -486,9 +512,23 @@ class DualRelaxedIKBoxTracker(LeafSystem):
         if t > 6.0:
             z_target = z_b+0.4   # after 5s, lift EE target 3 cm
 
+        # Optional integrated Z offsets from the Z-axis integrators (one per robot).
+        z_off1 = 0.0
+        z_off2 = 0.0
+        try:
+            if self._z_adjusted_target1_port.HasValue(context):
+                z_off1 = float(self._z_adjusted_target1_port.Eval(context)[2])
+        except Exception:
+            pass
+        try:
+            if self._z_adjusted_target2_port.HasValue(context):
+                z_off2 = float(self._z_adjusted_target2_port.Eval(context)[2])
+        except Exception:
+            pass
+
         # --- Define target positions in the box frame ---
-        target_position1 = [x_b - half_extents[0] - pad_offset, y_b, z_target]
-        target_position2 = [x_b + half_extents[0] + pad_offset, y_b, z_target]
+        target_position1 = [x_b - half_extents[0] - pad_offset, y_b, z_target + z_off1]
+        target_position2 = [x_b + half_extents[0] + pad_offset, y_b, z_target + z_off2]
 
         # --- Define orientations relative to box frame ---
         orientation1 = R.from_euler("y", 90, degrees=True).as_quat()  # palm toward +x
@@ -768,9 +808,139 @@ class IKSplitter(LeafSystem):
         robot2_targets = full_targets[self.nq1 : self.nq1 + self.nq2]
         output.SetFromVector(robot2_targets)
 
+# --- Z-axis integrator helpers (dual-arm) ---
+class _BoxPositionExtractor(LeafSystem):
+    """Extracts xyz position from 13-element box state."""
+    def __init__(self):
+        super().__init__()
+        self.DeclareVectorInputPort("box_state", size=13)
+        self.DeclareVectorOutputPort("box_position", size=3, calc=self.CalcOutput)
+
+    def CalcOutput(self, context, output):
+        box_state = self.GetInputPort("box_state").Eval(context)
+        output.SetFromVector(box_state[4:7])
+
+
+class _TargetPositionExtractor(LeafSystem):
+    """Computes a target xyz for the box center (used for z integration)."""
+    def __init__(self, *, t_lift_start: float = 6.0, lift_amount: float = 0.4):
+        super().__init__()
+        self.t_lift_start = float(t_lift_start)
+        self.lift_amount = float(lift_amount)
+        self.DeclareVectorInputPort("box_state", size=13)
+        self.DeclareVectorOutputPort("target_position", size=3, calc=self.CalcOutput)
+
+    def CalcOutput(self, context, output):
+        box_state = self.GetInputPort("box_state").Eval(context)
+        x_b, y_b, z_b = box_state[4:7]
+        t = context.get_time()
+        z_target = z_b if t < self.t_lift_start else (z_b + self.lift_amount)
+        output.SetFromVector([x_b, y_b, z_target])
+
+
+class _ContactDetectorForIntegrator(LeafSystem):
+    """
+    Outputs 1.0 when the specified robot EE contacts the movable box, else 0.0.
+    Uses Drake point-pair contact results.
+    """
+    def __init__(self, plant, *, robot_id, movable_box_id, ee_body_names=None):
+        super().__init__()
+        self.plant = plant
+        self.robot_id = robot_id
+        self.movable_box_id = movable_box_id
+        self.ee_body_names = ee_body_names or ["rubber_pad", "panda_hand"]
+
+        self.DeclareAbstractInputPort(
+            "contact_results",
+            plant.get_contact_results_output_port().Allocate(),
+        )
+        self.DeclareVectorOutputPort("contact", size=1, calc=self.CalcOutput)
+
+        # Cache body indices for box + EE
+        self._box_body_indices = None
+        self._ee_body_indices = None
+
+    def _ensure_cache(self):
+        if self._box_body_indices is None:
+            self._box_body_indices = set()
+            for i in range(self.plant.num_bodies()):
+                b = self.plant.get_body(BodyIndex(i))
+                if b.model_instance() == self.movable_box_id:
+                    self._box_body_indices.add(b.index())
+
+        if self._ee_body_indices is None:
+            self._ee_body_indices = set()
+            for name in self.ee_body_names:
+                try:
+                    b = self.plant.GetBodyByName(name, self.robot_id)
+                    self._ee_body_indices.add(b.index())
+                except Exception:
+                    continue
+
+    def CalcOutput(self, context, output):
+        self._ensure_cache()
+        contact_results = self.GetInputPort("contact_results").Eval(context)
+
+        if not self._ee_body_indices or not self._box_body_indices:
+            output.SetFromVector([0.0])
+            return
+
+        detected = False
+        n = contact_results.num_point_pair_contacts()
+        for i in range(n):
+            info = contact_results.point_pair_contact_info(i)
+            a = info.bodyA_index()
+            b = info.bodyB_index()
+            if (a in self._ee_body_indices and b in self._box_body_indices) or (
+                b in self._ee_body_indices and a in self._box_body_indices
+            ):
+                detected = True
+                break
+
+        output.SetFromVector([1.0 if detected else 0.0])
+
 # Add all systems to the diagram
 dual_ik_tracker = builder.AddSystem(DualRelaxedIKBoxTracker(plant, plant_context, panda1_id, panda2_id))
 ik_splitter = builder.AddSystem(IKSplitter(num_positions_1, num_positions_2))
+
+# Z-axis integrators (one per arm) gated by per-arm contact with the movable box.
+target_extractor = builder.AddSystem(_TargetPositionExtractor(t_lift_start=6.0, lift_amount=0.4))
+box_pos_extractor = builder.AddSystem(_BoxPositionExtractor())
+contact_detector_r1 = builder.AddSystem(
+    _ContactDetectorForIntegrator(
+        plant, robot_id=panda1_id, movable_box_id=movable_box_id
+    )
+)
+contact_detector_r2 = builder.AddSystem(
+    _ContactDetectorForIntegrator(
+        plant, robot_id=panda2_id, movable_box_id=movable_box_id
+    )
+)
+
+z_integrator_r1 = builder.AddNamedSystem(
+    "ZAxisIntegratorRobot1",
+    make_integrate_z_two_in_block(
+        Ki_z=0.7,
+        z_min=-0.5,
+        z_max=5.0,
+        Kaw_z=0.1,
+        error_mode="a_minus_b",
+        passthrough_xy_from="a",
+        name="ZAxisIntegratorRobot1",
+    ),
+)
+z_integrator_r2 = builder.AddNamedSystem(
+    "ZAxisIntegratorRobot2",
+    make_integrate_z_two_in_block(
+        Ki_z=0.7,
+        z_min=-0.5,
+        z_max=5.0,
+        Kaw_z=0.1,
+        error_mode="a_minus_b",
+        passthrough_xy_from="a",
+        name="ZAxisIntegratorRobot2",
+    ),
+)
 
 # Create two separate ERG systems (one for each robot)
 erg1 = builder.AddSystem(ERG(plant, panda1_id, "robot1"))
@@ -829,6 +999,20 @@ ik_ref_logger1.set_name("ik_ref_logger1")
 ik_ref_logger2 = LogVectorOutput(ik_splitter.GetOutputPort("robot2_targets"), builder)
 ik_ref_logger2.set_name("ik_ref_logger2")
 
+# Log Z-axis integrator outputs and contact flags (one per robot)
+z_int_logger_r1 = LogVectorOutput(z_integrator_r1.GetOutputPort("u"), builder)
+z_int_logger_r1.set_name("z_int_logger_r1")
+z_int_logger_r2 = LogVectorOutput(z_integrator_r2.GetOutputPort("u"), builder)
+z_int_logger_r2.set_name("z_int_logger_r2")
+z_err_logger_r1 = LogVectorOutput(z_integrator_r1.GetOutputPort("ez"), builder)
+z_err_logger_r1.set_name("z_err_logger_r1")
+z_err_logger_r2 = LogVectorOutput(z_integrator_r2.GetOutputPort("ez"), builder)
+z_err_logger_r2.set_name("z_err_logger_r2")
+contact_flag_logger_r1 = LogVectorOutput(contact_detector_r1.GetOutputPort("contact"), builder)
+contact_flag_logger_r1.set_name("contact_flag_logger_r1")
+contact_flag_logger_r2 = LogVectorOutput(contact_detector_r2.GetOutputPort("contact"), builder)
+contact_flag_logger_r2.set_name("contact_flag_logger_r2")
+
 box_pos_logger = LogVectorOutput(plant.get_state_output_port(movable_box_id), builder)
 box_pos_logger.set_name("box_pos_logger")
 
@@ -854,6 +1038,61 @@ fcl_logger2.set_name("fcl_logger2")
 # Connect all systems
 # Box state to IK tracker
 builder.Connect(plant.get_state_output_port(movable_box_id), dual_ik_tracker.GetInputPort("box_state"))
+
+# Z-axis integrator wiring (shared box signals, per-arm contact gates)
+builder.Connect(
+    plant.get_state_output_port(movable_box_id),
+    target_extractor.GetInputPort("box_state"),
+)
+builder.Connect(
+    plant.get_state_output_port(movable_box_id),
+    box_pos_extractor.GetInputPort("box_state"),
+)
+builder.Connect(
+    plant.get_contact_results_output_port(),
+    contact_detector_r1.GetInputPort("contact_results"),
+)
+builder.Connect(
+    plant.get_contact_results_output_port(),
+    contact_detector_r2.GetInputPort("contact_results"),
+)
+
+# a (target) and b (measured) go to both integrators
+builder.Connect(
+    target_extractor.GetOutputPort("target_position"),
+    z_integrator_r1.GetInputPort("a"),
+)
+builder.Connect(
+    box_pos_extractor.GetOutputPort("box_position"),
+    z_integrator_r1.GetInputPort("b"),
+)
+builder.Connect(
+    contact_detector_r1.GetOutputPort("contact"),
+    z_integrator_r1.GetInputPort("contact"),
+)
+
+builder.Connect(
+    target_extractor.GetOutputPort("target_position"),
+    z_integrator_r2.GetInputPort("a"),
+)
+builder.Connect(
+    box_pos_extractor.GetOutputPort("box_position"),
+    z_integrator_r2.GetInputPort("b"),
+)
+builder.Connect(
+    contact_detector_r2.GetOutputPort("contact"),
+    z_integrator_r2.GetInputPort("contact"),
+)
+
+# Feed integrated Z offsets into the dual IK tracker (one per arm)
+builder.Connect(
+    z_integrator_r1.GetOutputPort("u"),
+    dual_ik_tracker.GetInputPort("z_adjusted_target1"),
+)
+builder.Connect(
+    z_integrator_r2.GetOutputPort("u"),
+    dual_ik_tracker.GetInputPort("z_adjusted_target2"),
+)
 
 # Connect IK system to ERG (replacing the trajectory) - following test_erg.py pattern
 builder.Connect(dual_ik_tracker.GetOutputPort("ik_joint_targets"), ik_splitter.GetInputPort("ik_joint_targets"))
@@ -935,6 +1174,12 @@ log_pose = pose_logger.FindLog(diagram_context)
 log_rpad = rpad_logger.FindLog(diagram_context)
 log_fcl1 = fcl_logger1.FindLog(diagram_context)
 log_fcl2 = fcl_logger2.FindLog(diagram_context)
+log_z_int_r1 = z_int_logger_r1.FindLog(diagram_context)
+log_z_int_r2 = z_int_logger_r2.FindLog(diagram_context)
+log_z_err_r1 = z_err_logger_r1.FindLog(diagram_context)
+log_z_err_r2 = z_err_logger_r2.FindLog(diagram_context)
+log_contact_flag_r1 = contact_flag_logger_r1.FindLog(diagram_context)
+log_contact_flag_r2 = contact_flag_logger_r2.FindLog(diagram_context)
 
 
 # Extract time data
@@ -987,6 +1232,23 @@ t_rpad = log_rpad.sample_times()
 data_fcl1 = log_fcl1.data().transpose()  # Robot 1 FCL distances (4 links)
 data_fcl2 = log_fcl2.data().transpose()  # Robot 2 FCL distances (4 links)
 
+# Extract Z-axis integrator outputs (u is 3D; u[2] is the integrated Z term)
+data_z_int_r1 = log_z_int_r1.data().transpose()  # shape: (N, 3)
+data_z_int_r2 = log_z_int_r2.data().transpose()  # shape: (N, 3)
+t_z_int_r1 = log_z_int_r1.sample_times()
+t_z_int_r2 = log_z_int_r2.sample_times()
+
+# Extract Z error (ez = desired_z - measured_z) and contact flags
+data_z_err_r1 = log_z_err_r1.data().transpose().reshape(-1)  # shape: (N,)
+data_z_err_r2 = log_z_err_r2.data().transpose().reshape(-1)  # shape: (N,)
+t_z_err_r1 = log_z_err_r1.sample_times()
+t_z_err_r2 = log_z_err_r2.sample_times()
+
+data_contact_flag_r1 = log_contact_flag_r1.data().transpose().reshape(-1)
+data_contact_flag_r2 = log_contact_flag_r2.data().transpose().reshape(-1)
+t_contact_flag_r1 = log_contact_flag_r1.sample_times()
+t_contact_flag_r2 = log_contact_flag_r2.sample_times()
+
 
 
 print("\n=== Dual Robot Simulation Results ===")
@@ -1016,112 +1278,168 @@ print(f"Robot 1 final rubber_pad quaternion [w, x, y, z]: {robot1_pad_pose.rotat
 print(f"Robot 2 final rubber_pad quaternion [w, x, y, z]: {robot2_pad_pose.rotation().ToQuaternion().wxyz()}")
 
 
-# Create plots for both robots
-plt.figure(figsize=(14, 12))
+# -----------------------------
+# Cleaner overview plots
+# -----------------------------
+fig_overview, axs = plt.subplots(3, 3, figsize=(22, 12), sharex=True)
+axs = axs.reshape(3, 3)
 
-# Robot 1 joint positions
-plt.subplot(3, 3, 1)
-for i in range(7):  # All 9 joints (7 arm + 2 gripper)
-    plt.plot(t_time, data_q1[:, i], label=f'Joint {i+1}')
-plt.title('Robot 1 Joint Positions')
-plt.xlabel('Time (s)')
-plt.ylabel('Position (rad)')
-plt.legend()
-plt.grid(True)
+joint_colors = plt.cm.tab10(np.linspace(0, 1, 7))
+fcl_labels = ["link7", "hand", "leftfinger", "rightfinger"]
 
-# Robot 2 joint positions
-plt.subplot(3, 3, 2)
-for i in range(7):  # All 9 joints (7 arm + 2 gripper)
-    plt.plot(t_time, data_q2[:, i], label=f'Joint {i+1}')
-plt.title('Robot 2 Joint Positions')
-plt.xlabel('Time (s)')
-plt.ylabel('Position (rad)')
-plt.legend()
-plt.grid(True)
+# (1) Robot 1 joint positions
+ax = axs[0, 0]
+for i in range(7):
+    ax.plot(t_time, data_q1[:, i], color=joint_colors[i], linewidth=1.6, label=f"J{i+1}")
+ax.set_title("Robot 1 Joint Positions")
+ax.set_ylabel("Position (rad)")
+ax.grid(True, alpha=0.3)
+ax.legend(ncol=2, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
 
-# Box position
-plt.subplot(3, 3, 3)
-box_positions = data_box_pos[:, 4:7]  # x, y, z
-plt.plot(t_time, box_positions[:, 0], label='X')
-plt.plot(t_time, box_positions[:, 1], label='Y')
-plt.plot(t_time, box_positions[:, 2], label='Z')
-plt.title('Box Position')
-plt.xlabel('Time (s)')
-plt.ylabel('Position (m)')
-plt.legend()
-plt.grid(True)
+# (2) Robot 2 joint positions
+ax = axs[0, 1]
+for i in range(7):
+    ax.plot(t_time, data_q2[:, i], color=joint_colors[i], linewidth=1.6, label=f"J{i+1}")
+ax.set_title("Robot 2 Joint Positions")
+ax.set_ylabel("Position (rad)")
+ax.grid(True, alpha=0.3)
+ax.legend(ncol=2, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
 
-# Robot 1 torques
-plt.subplot(3, 3, 4)
-for i in range(7):  # All 9 joints (7 arm + 2 gripper)
-    plt.plot(t_time, data_tau1[:, i], label=f'Joint {i+1}')
-plt.title('Robot 1 Torques')
-plt.xlabel('Time (s)')
-plt.ylabel('Torque (Nm)')
-plt.legend()
-plt.grid(True)
+# (3) Box position
+ax = axs[0, 2]
+box_positions = data_box_pos[:, 4:7]
+ax.plot(t_time, box_positions[:, 0], label="X", linewidth=2.0)
+ax.plot(t_time, box_positions[:, 1], label="Y", linewidth=2.0)
+ax.plot(t_time, box_positions[:, 2], label="Z", linewidth=2.0)
+ax.set_title("Box Position")
+ax.set_ylabel("Position (m)")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=9, loc="best", frameon=True)
 
-# Robot 2 torques
-plt.subplot(3, 3, 5)
-for i in range(7):  # All 9 joints (7 arm + 2 gripper)
-    plt.plot(t_time, data_tau2[:, i], label=f'Joint {i+1}')
-plt.title('Robot 2 Torques')
-plt.xlabel('Time (s)')
-plt.ylabel('Torque (Nm)')
-plt.legend()
-plt.grid(True)
+# (4) Robot 1 torques
+ax = axs[1, 0]
+for i in range(7):
+    ax.plot(t_time, data_tau1[:, i], color=joint_colors[i], linewidth=1.6, label=f"J{i+1}")
+ax.set_title("Robot 1 Torques")
+ax.set_ylabel("Torque (Nm)")
+ax.grid(True, alpha=0.3)
+ax.legend(ncol=2, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
 
-# Contact forces
-plt.subplot(3, 3, 6)
-plt.plot(t_time, data_contact_forces[:, 0], label='Robot 1 X')
-plt.plot(t_time, data_contact_forces[:, 1], label='Robot 1 Y')
-plt.plot(t_time, data_contact_forces[:, 2], label='Robot 1 Z')
-plt.plot(t_time, data_contact_forces[:, 3], label='Robot 2 X')
-plt.plot(t_time, data_contact_forces[:, 4], label='Robot 2 Y')
-plt.plot(t_time, data_contact_forces[:, 5], label='Robot 2 Z')
-plt.title('Contact Forces')
-plt.xlabel('Time (s)')
-plt.ylabel('Force (N)')
-plt.legend()
-plt.grid(True)
+# (5) Robot 2 torques
+ax = axs[1, 1]
+for i in range(7):
+    ax.plot(t_time, data_tau2[:, i], color=joint_colors[i], linewidth=1.6, label=f"J{i+1}")
+ax.set_title("Robot 2 Torques")
+ax.set_ylabel("Torque (Nm)")
+ax.grid(True, alpha=0.3)
+ax.legend(ncol=2, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
 
-# FCL distances for Robot 1
-plt.subplot(3, 3, 7)
-fcl_labels = ['link7', 'hand', 'leftfinger', 'rightfinger']
-for i in range(4):
-    plt.plot(t_time, data_fcl1[:, i], label=fcl_labels[i])
-plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
-plt.title('Robot 1 FCL Distances to Box')
-plt.xlabel('Time (s)')
-plt.ylabel('Signed Distance (m)')
-plt.legend()
-plt.grid(True)
+# (6) Contact forces
+ax = axs[1, 2]
+ax.plot(t_time, data_contact_forces[:, 0], label="R1 Fx")
+ax.plot(t_time, data_contact_forces[:, 1], label="R1 Fy")
+ax.plot(t_time, data_contact_forces[:, 2], label="R1 Fz")
+ax.plot(t_time, data_contact_forces[:, 3], label="R2 Fx")
+ax.plot(t_time, data_contact_forces[:, 4], label="R2 Fy")
+ax.plot(t_time, data_contact_forces[:, 5], label="R2 Fz")
+ax.set_title("Contact Forces")
+ax.set_ylabel("Force (N)")
+ax.grid(True, alpha=0.3)
+ax.legend(ncol=3, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
 
-# FCL distances for Robot 2
-plt.subplot(3, 3, 8)
-for i in range(4):
-    plt.plot(t_time, data_fcl2[:, i], label=fcl_labels[i])
-plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
-plt.title('Robot 2 FCL Distances to Box')
-plt.xlabel('Time (s)')
-plt.ylabel('Signed Distance (m)')
-plt.legend()
-plt.grid(True)
+# (7) FCL distances robot 1
+ax = axs[2, 0]
+ncols_fcl1 = 1 if getattr(data_fcl1, "ndim", 1) == 1 else int(data_fcl1.shape[1])
+for i in range(int(min(4, ncols_fcl1))):
+    y = data_fcl1 if ncols_fcl1 == 1 else data_fcl1[:, i]
+    label = "distance" if ncols_fcl1 == 1 else fcl_labels[i]
+    ax.plot(t_time, y, label=label)
+ax.axhline(0.0, color="r", linestyle="--", alpha=0.6)
+ax.set_title("Robot 1 FCL Distances to Box")
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Signed dist (m)")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=9, loc="best", frameon=True)
 
-# Combined minimum FCL distances
-plt.subplot(3, 3, 7)
-min_fcl1 = np.min(data_fcl1, axis=1)  # Minimum distance per timestep for robot 1
-min_fcl2 = np.min(data_fcl2, axis=1)  # Minimum distance per timestep for robot 2
-plt.plot(t_time, min_fcl1, label='Robot 1 Min Distance', linewidth=2)
-plt.plot(t_time, min_fcl2, label='Robot 2 Min Distance', linewidth=2)
-plt.axhline(0.0, color='r', linestyle='--', alpha=0.6)
-plt.title('Minimum FCL Distances to Box')
-plt.xlabel('Time (s)')
-plt.ylabel('Min Signed Distance (m)')
-plt.legend()
-plt.grid(True)
+# (8) FCL distances robot 2
+ax = axs[2, 1]
+ncols_fcl2 = 1 if getattr(data_fcl2, "ndim", 1) == 1 else int(data_fcl2.shape[1])
+for i in range(int(min(4, ncols_fcl2))):
+    y = data_fcl2 if ncols_fcl2 == 1 else data_fcl2[:, i]
+    label = "distance" if ncols_fcl2 == 1 else fcl_labels[i]
+    ax.plot(t_time, y, label=label)
+ax.axhline(0.0, color="r", linestyle="--", alpha=0.6)
+ax.set_title("Robot 2 FCL Distances to Box")
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Signed dist (m)")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=9, loc="best", frameon=True)
 
-plt.tight_layout()
+# (9) Minimum FCL distances
+ax = axs[2, 2]
+min_fcl1 = data_fcl1 if ncols_fcl1 == 1 else np.min(data_fcl1, axis=1)
+min_fcl2 = data_fcl2 if ncols_fcl2 == 1 else np.min(data_fcl2, axis=1)
+ax.plot(t_time, min_fcl1, label="Robot 1 min", linewidth=2.2)
+ax.plot(t_time, min_fcl2, label="Robot 2 min", linewidth=2.2)
+ax.axhline(0.0, color="r", linestyle="--", alpha=0.6)
+ax.set_title("Minimum FCL Distance to Box")
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Min signed dist (m)")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=9, loc="best", frameon=True)
+
+fig_overview.suptitle("Dual Robot Overview", fontsize=14)
+fig_overview.tight_layout()
+
+# Z-axis integrator output (u[2]) for both robots (separate clean figure)
+fig_z, ax_z = plt.subplots(1, 1, figsize=(12, 5))
+ax_z.plot(t_z_int_r1, data_z_int_r1[:, 2], label="Robot 1 u[2] (integrated Z)", linewidth=2.0)
+ax_z.plot(t_z_int_r2, data_z_int_r2[:, 2], label="Robot 2 u[2] (integrated Z)", linewidth=2.0)
+ax_z.set_title("Z-axis Integrator Output (u[2])")
+ax_z.set_xlabel("Time (s)")
+ax_z.set_ylabel("Integrated Z (m)")
+ax_z.grid(True, alpha=0.3)
+ax_z.legend()
+fig_z.tight_layout()
+
+# Z-error (desired_z - measured_z) with contact markers (vertical lines)
+fig_ez, axs_ez = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+def _contact_rising_edges(t_contact, contact_values):
+    edges = []
+    if contact_values.size == 0:
+        return edges
+    prev = contact_values[0]
+    for i in range(1, len(contact_values)):
+        cur = contact_values[i]
+        if (cur > 0.5) and (prev <= 0.5):
+            edges.append(float(t_contact[i]))
+        prev = cur
+    return edges
+
+edges_r1 = _contact_rising_edges(t_contact_flag_r1, data_contact_flag_r1)
+edges_r2 = _contact_rising_edges(t_contact_flag_r2, data_contact_flag_r2)
+
+axs_ez[0].plot(t_z_err_r1, data_z_err_r1, linewidth=2.0, label="Robot 1 ez")
+for k, te in enumerate(edges_r1):
+    axs_ez[0].axvline(te, color="r", linestyle="--", alpha=0.7, linewidth=1.5,
+                      label="Contact starts" if k == 0 else None)
+axs_ez[0].set_title("Robot 1: Z error (desired_z - measured_z) with contact start times")
+axs_ez[0].set_ylabel("ez (m)")
+axs_ez[0].grid(True, alpha=0.3)
+axs_ez[0].legend()
+
+axs_ez[1].plot(t_z_err_r2, data_z_err_r2, linewidth=2.0, label="Robot 2 ez")
+for k, te in enumerate(edges_r2):
+    axs_ez[1].axvline(te, color="r", linestyle="--", alpha=0.7, linewidth=1.5,
+                      label="Contact starts" if k == 0 else None)
+axs_ez[1].set_title("Robot 2: Z error (desired_z - measured_z) with contact start times")
+axs_ez[1].set_xlabel("Time (s)")
+axs_ez[1].set_ylabel("ez (m)")
+axs_ez[1].grid(True, alpha=0.3)
+axs_ez[1].legend()
+
+fig_ez.tight_layout()
 
 # Plot joint-level comparison: Actual q vs ERG command vs RelaxedIK reference.
 joint_limits_lower = np.zeros(7)
