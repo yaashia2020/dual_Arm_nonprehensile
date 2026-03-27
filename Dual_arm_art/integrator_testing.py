@@ -1078,55 +1078,53 @@ builder.Connect(plant.get_contact_results_output_port(),
 z_integrator = builder.AddNamedSystem("ZAxisIntegrator", 
                                      make_integrate_z_two_in_block(
                                          Ki_z=0.7,  # Integral gain for Z (reduced for stability)
-                                         z_min=-0.5,  # Minimum Z limit
+                                         z_min=0.0,   # No negative integration — only correct slip downward
                                          z_max=5.0,   # Maximum Z limit
-                                         Kaw_z=0.1,   # Anti-windup gain
+                                         Kaw_z=0.7,   # Anti-windup gain (matched to Ki_z)
                                          error_mode="a_minus_b",  # a.z - b.z
                                          passthrough_xy_from="a",  # Use X,Y from first input
                                          name="ZAxisIntegrator"
                                      ))
 
-# First input: RelaxedIK target position (where we want the box to be)
-# We need to extract target Z from RelaxedIK
-# For now, use box Z + lift_amount as target (will be refined)
+# First input: freeze box Z at first contact, then hold it as the reference.
+# Before contact: outputs current box Z so ez=0 (no integration).
+# After first contact: holds the frozen Z — any slip below it drives the integrator up.
 class TargetPositionExtractor(LeafSystem):
-    def __init__(self, t_lift_start, lift_amount):
+    def __init__(self):
         super().__init__()
-        self.t_lift_start = t_lift_start
-        self.lift_amount = lift_amount
-        
-        # Input: box state
         self.DeclareVectorInputPort("box_state", size=13)
-        # Output: target 3D position
+        self.DeclareVectorInputPort("contact", size=1)
+        # discrete state: [frozen_z, contact_ever]
+        self.DeclareDiscreteState(2)
         self.DeclareVectorOutputPort("target_position", size=3, calc=self.CalcOutput)
-    
-    def CalcOutput(self, context, output):
-        # Get box state
-        box_state = self.GetInputPort("box_state").Eval(context)
-        
-        # We need to get current time to calculate target
-        t = context.get_time()
-        
-        # Extract box position (indices 4:7 in 13-state vector)
-        x_b, y_b, z_b = box_state[4:7]
-        
-        # Calculate target Z (same logic as RelaxedIK)
-        z_target = z_b if t < self.t_lift_start else (z_b + self.lift_amount)
-        
-        # Target position
-        target_pos = np.array([x_b, y_b, z_target])
-        output.set_value(target_pos)
+        self.DeclarePeriodicDiscreteUpdateEvent(
+            period_sec=0.001, offset_sec=0.0, update=self.Update
+        )
 
-# Create target position extractor
-target_extractor = builder.AddSystem(TargetPositionExtractor(
-    t_lift_start=6.0,
-    lift_amount=0.40
-))
-# Connect box state to target extractor (same as IK tracker)
+    def Update(self, context, discrete_state):
+        s = context.get_discrete_state_vector().CopyToVector()
+        frozen_z, contact_ever = s[0], s[1]
+        contact = self.GetInputPort("contact").Eval(context)[0]
+        if contact_ever < 0.5 and contact > 0.5:
+            box_state = self.GetInputPort("box_state").Eval(context)
+            frozen_z = float(box_state[6]) + 0.4  # target = contact height + lift offset
+            contact_ever = 1.0
+        discrete_state.get_mutable_vector().SetFromVector([frozen_z, contact_ever])
+
+    def CalcOutput(self, context, output):
+        box_state = self.GetInputPort("box_state").Eval(context)
+        x_b, y_b, z_b = box_state[4:7]
+        s = context.get_discrete_state_vector().CopyToVector()
+        frozen_z, contact_ever = s[0], s[1]
+        z_ref = frozen_z if contact_ever > 0.5 else z_b
+        output.SetFromVector([x_b, y_b, z_ref])
+
+target_extractor = builder.AddSystem(TargetPositionExtractor())
 builder.Connect(plant.get_state_output_port(box_id),
                 target_extractor.GetInputPort("box_state"))
+builder.Connect(contact_detector.GetOutputPort("contact"),
+                target_extractor.GetInputPort("contact"))
 
-# First input: target Z position
 builder.Connect(target_extractor.GetOutputPort("target_position"),
                z_integrator.GetInputPort("a"))
 
@@ -1375,9 +1373,144 @@ except Exception as e:
     # print(f"Error getting final body poses: {e}")
     pass
 
-# Create a figure for panda_link7 world positions
-fig_panda_link7, axs_panda_link7 = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_panda_link7.suptitle('Panda Link7 World Positions (XYZ) - Direct Pose Extraction')
+####################################
+# Debug prints: box lift analysis
+####################################
+box_z = data_box_pos[:, 6]
+pad_z = data_rubber_pad_world[:, 2]
+integ_z = data_z_integrated[:, 2]
+contact_vals = data_contact_flag.flatten()
+
+# Find first contact time
+contact_idx = np.where(contact_vals > 0.5)[0]
+t_contact = t_time[contact_idx[0]] if len(contact_idx) > 0 else None
+box_z_at_contact = box_z[contact_idx[0]] if t_contact is not None else None
+
+# Find t=6s (lift start) index
+lift_idx = np.searchsorted(t_time, 6.0)
+t_end_idx = -1
+
+print("\n=== Box Lift Debug ===")
+if t_contact is not None:
+    print(f"First contact at t={t_contact:.2f}s,  box_z={box_z_at_contact:.4f}m")
+    print(f"Frozen Z reference (target) = box_z_at_contact + 0.4 = {box_z_at_contact + 0.4:.4f}m")
+else:
+    print("No contact detected during simulation!")
+print(f"Box Z at t=0s   : {box_z[0]:.4f}m")
+print(f"Box Z at t=6s   : {box_z[lift_idx]:.4f}m")
+print(f"Box Z at t=end  : {box_z[t_end_idx]:.4f}m")
+print(f"Box Z lift achieved: {box_z[t_end_idx] - box_z[0]:.4f}m  (expected ~0.4m)")
+print(f"Rubber pad Z at t=0s  : {pad_z[0]:.4f}m")
+print(f"Rubber pad Z at t=end : {pad_z[t_end_idx]:.4f}m")
+print(f"Rubber pad Z lift     : {pad_z[t_end_idx] - pad_z[0]:.4f}m")
+print(f"Integrator u[2] at end: {integ_z[t_end_idx]:.4f}m")
+print(f"Box Z gap from target at end: {(box_z_at_contact + 0.4 if box_z_at_contact else 0) - box_z[t_end_idx]:.4f}m")
+print("=" * 40)
+
+####################################
+# ERG energy limit
+####################################
+E_max = erg_system.erg.E_max_  # from trajectoryERG.py line 202
+
+####################################
+# Plot 1: All world positions (X, Y, Z) — link7, rubber_pad, box — in one figure
+####################################
+fig_world, axs_world = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+fig_world.suptitle('World Positions: Link7 / Rubber Pad / Box', fontsize=13)
+labels_xyz = ['X [m]', 'Y [m]', 'Z [m]']
+for i in range(3):
+    axs_world[i].plot(t_time, panda_link7_positions[:, i], label='link7',      color='steelblue',  linewidth=2)
+    axs_world[i].plot(t_time, data_rubber_pad_world[:, i],  label='rubber_pad', color='darkorange',  linewidth=2)
+    axs_world[i].plot(t_time, data_box_pos[:, 4+i],         label='box',        color='green',       linewidth=2)
+    axs_world[i].set_ylabel(labels_xyz[i])
+    axs_world[i].grid(True, alpha=0.3)
+    axs_world[i].set_xlim([t_time[0], t_time[-1]])
+axs_world[0].legend(loc='upper right')
+axs_world[2].set_xlabel('Time [s]')
+plt.tight_layout()
+plt.show()
+
+####################################
+# Plot 2: Joint positions — all 7 joints, each with q / q_v / q_r + limits
+####################################
+fig_joints, axs_joints = plt.subplots(7, 1, figsize=(14, 18), sharex=True)
+fig_joints.suptitle('Joint Positions: actual (q) / ERG ref (q_v) / IK cmd (q_r) + limits', fontsize=13)
+colors7 = plt.cm.tab10(np.linspace(0, 0.7, 7))
+for i in range(7):
+    ax = axs_joints[i]
+    ax.plot(t_time, data_q[:, i],  color=colors7[i], linewidth=2,   linestyle='-',  label='q (actual)')
+    ax.plot(t_time, data_qv[:, i], color=colors7[i], linewidth=1.5, linestyle='--', label='q_v (ERG)')
+    ax.plot(t_time, data_qr[:, i], color=colors7[i], linewidth=1.5, linestyle=':',  label='q_r (IK)')
+    ax.axhline(limit_q_min[i], color='red',  linewidth=1.0, linestyle='--', alpha=0.7, label='limits')
+    ax.axhline(limit_q_max[i], color='red',  linewidth=1.0, linestyle='--', alpha=0.7)
+    ax.set_ylabel(f'J{i+1} [rad]', fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([t_time[0], t_time[-1]])
+axs_joints[0].legend(loc='upper right', fontsize=8, ncol=4)
+axs_joints[6].set_xlabel('Time [s]')
+plt.tight_layout()
+plt.show()
+
+####################################
+# Plot 3: Energy + Emax in one graph
+####################################
+fig_energy, ax_energy = plt.subplots(1, 1, figsize=(12, 5))
+fig_energy.suptitle('ERG Energy vs Emax', fontsize=13)
+ax_energy.plot(t_time, data_energy[:, 0], color='steelblue', linewidth=2, label='Energy')
+ax_energy.axhline(E_max, color='red', linewidth=1.5, linestyle='--', label=f'E_max = {E_max:.3f}')
+ax_energy.set_ylabel('Energy [J]')
+ax_energy.set_xlabel('Time [s]')
+ax_energy.grid(True, alpha=0.3)
+ax_energy.legend(loc='upper right')
+ax_energy.set_xlim([t_time[0], t_time[-1]])
+plt.tight_layout()
+plt.show()
+
+####################################
+# Plot 4: Z integrator + box Z + contact flag
+####################################
+fig_z, axs_z = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+fig_z.suptitle('Z Integrator / Box Z / Contact', fontsize=13)
+axs_z[0].plot(t_time, integ_z,          color='darkorange', linewidth=2, label='u[2] (integrated Z)')
+axs_z[0].plot(t_time, pad_z,            color='steelblue',  linewidth=2, label='rubber_pad Z')
+if box_z_at_contact is not None:
+    axs_z[0].axhline(box_z_at_contact + 0.4, color='green', linewidth=1.5, linestyle='--', label=f'target Z={box_z_at_contact+0.4:.3f}')
+axs_z[0].set_ylabel('Z [m]')
+axs_z[0].legend(fontsize=9)
+axs_z[0].grid(True, alpha=0.3)
+axs_z[1].plot(t_time, box_z, color='green', linewidth=2, label='box Z')
+if box_z_at_contact is not None:
+    axs_z[1].axhline(box_z_at_contact + 0.4, color='red', linewidth=1.5, linestyle='--', label='target Z')
+axs_z[1].set_ylabel('Box Z [m]')
+axs_z[1].legend(fontsize=9)
+axs_z[1].grid(True, alpha=0.3)
+axs_z[2].plot(t_time, contact_vals, color='purple', linewidth=2, drawstyle='steps-post', label='contact')
+axs_z[2].set_ylim(-0.1, 1.2)
+axs_z[2].set_ylabel('contact')
+axs_z[2].set_xlabel('Time [s]')
+axs_z[2].grid(True, alpha=0.3)
+for ax in axs_z:
+    ax.set_xlim([t_time[0], t_time[-1]])
+plt.tight_layout()
+plt.show()
+
+####################################
+# Plot 5: Contact forces
+####################################
+fig_contact, axs_contact = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
+fig_contact.suptitle('Contact Forces (X, Y, Z)', fontsize=13)
+for i, (label, color) in enumerate([('Fx', 'red'), ('Fy', 'green'), ('Fz', 'blue')]):
+    axs_contact[i].plot(t_time, data_contact_forces[:, i], color=color, linewidth=2, label=label)
+    axs_contact[i].set_ylabel(f'{label} [N]')
+    axs_contact[i].grid(True, alpha=0.3)
+    axs_contact[i].set_xlim([t_time[0], t_time[-1]])
+axs_contact[0].legend()
+axs_contact[2].set_xlabel('Time [s]')
+plt.tight_layout()
+plt.show()
+
+print("\nPlots displayed. Close windows or press Enter to continue...")
+input()
 
 # Plot panda_link7 positions
 axs_panda_link7[0].plot(t_time, panda_link7_positions[:, 0], label='Position X', linestyle='-', color='red', linewidth=2)
@@ -1406,320 +1539,3 @@ plt.show()
 # print(f"Y range: [{np.min(panda_link7_positions[:, 1]):.4f}, {np.max(panda_link7_positions[:, 1]):.4f}] m")
 # print(f"Z range: [{np.min(panda_link7_positions[:, 2]):.4f}, {np.max(panda_link7_positions[:, 2]):.4f}] m")
 
-# Identify modified joints (comparing with initial configuration)
-modified_indices = np.where(trajInit_ != 0)[0]  # Find non-zero initial positions
-
-# Joint names and number of modified positions
-joint_names = ['Panda joint 1', 'Panda joint 2', 'Panda joint 3', 'Panda joint 4', 'Panda joint 5', 'Panda joint 6', 'Panda joint 7', 'panda_figer1', 'panda_figer2']
-modified_joint_names = [joint_names[i] for i in modified_indices]
-
-num_positions = len(modified_indices)  # Number of modified joints
-
-# Create a figure for position plots for modified joints
-fig_pos, axs_pos = plt.subplots(num_positions, 1, figsize=(12, 3*num_positions), sharex=True)
-fig_pos.suptitle('Joint Positions')
-
-for idx, joint_idx in enumerate(modified_indices):
-    axs_pos[idx].plot(t_time, data_q[:, joint_idx], label='Joint position', linestyle='-')
-    axs_pos[idx].plot(t_time, data_qv[:, joint_idx], label='Filtered reference position', linestyle='--')
-    axs_pos[idx].plot(t_time, data_qr[:, joint_idx], label='Reference position', linestyle=':')
-    axs_pos[idx].set_ylabel('Position [rad]')
-    axs_pos[idx].set_title(f'{modified_joint_names[idx]}')
-    axs_pos[idx].grid(True)
-    # Set x-axis limits
-    axs_pos[idx].set_xlim([t_time[1], t_time[-1]])
-
-# Add legend to the top of the first subplot
-axs_pos[0].legend(loc='upper right')
-
-# Set common xlabel
-axs_pos[-1].set_xlabel('Time [s]')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create a figure for velocity plots for modified joints
-fig_vel, axs_vel = plt.subplots(num_positions, 1, figsize=(12, 3*num_positions), sharex=True)
-fig_vel.suptitle('Joint Velocities')
-
-for idx, joint_idx in enumerate(modified_indices):
-    axs_vel[idx].plot(t_time, data_qdot[:, joint_idx], label='Joint velocity', linestyle='-')
-    axs_vel[idx].plot(t_time, limit_dq[joint_idx] * np.ones_like(t_time), 'r--', label='Velocity limit')
-    axs_vel[idx].plot(t_time, -limit_dq[joint_idx] * np.ones_like(t_time), 'r--')
-    axs_vel[idx].set_ylabel('Velocity [rad/s]')
-    axs_vel[idx].set_title(f'{modified_joint_names[idx]}')
-    axs_vel[idx].grid(True)
-    # Set x-axis limits
-    axs_vel[idx].set_xlim([t_time[1], t_time[-1]])
-
-# Add legend to the top of the first subplot
-axs_vel[0].legend(loc='upper right')
-
-# Set common xlabel
-axs_vel[-1].set_xlabel('Time [s]')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create a figure for torque plots for modified joints
-fig_tau, axs_tau = plt.subplots(num_positions, 1, figsize=(12, 3*num_positions), sharex=True)
-fig_tau.suptitle('Joint Torques')
-
-for idx, joint_idx in enumerate(modified_indices):
-    axs_tau[idx].plot(t_time, data_tau[:, joint_idx], label='Applied torque', linestyle='-')
-    axs_tau[idx].plot(t_time, limit_tau[joint_idx] * np.ones_like(t_time), 'r--', label='Torque limit')
-    axs_tau[idx].plot(t_time, -limit_tau[joint_idx] * np.ones_like(t_time), 'r--')
-    axs_tau[idx].set_ylabel('Torque [Nm]')
-    axs_tau[idx].set_title(f'{modified_joint_names[idx]}')
-    axs_tau[idx].grid(True)
-    # Set x-axis limits
-    axs_tau[idx].set_xlim([t_time[1], t_time[-1]])
-
-# Add legend to the top of the first subplot
-axs_tau[0].legend(loc='upper right')
-
-# Set common xlabel
-axs_tau[-1].set_xlabel('Time [s]')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create a figure for box poses (all bodies)
-fig_box_poses, axs_box_poses = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_box_poses.suptitle('Movable Box Position (XYZ)')
-
-# The state data contains: [quaternion_w, quaternion_x, quaternion_y, quaternion_z, position_x, position_y, position_z]
-# Extract positions only
-position_data = data_box_pos[:, 4:7]    # Next 3 elements are spatial position
-
-# Plot positions
-axs_box_poses[0].plot(t_time, position_data[:, 0], label='Position X', linestyle='-', color='red')
-axs_box_poses[1].plot(t_time, position_data[:, 1], label='Position Y', linestyle='-', color='green')
-axs_box_poses[2].plot(t_time, position_data[:, 2], label='Position Z', linestyle='-', color='blue')
-
-axs_box_poses[0].set_ylabel('X Position [m]')
-axs_box_poses[1].set_ylabel('Y Position [m]')
-axs_box_poses[2].set_ylabel('Z Position [m]')
-axs_box_poses[2].set_xlabel('Time [s]')
-
-for ax in axs_box_poses:
-    ax.grid(True)
-    ax.legend(loc='upper right')
-    ax.set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Plot box position as seen inside Trajectory ERG (shifted X, same vector passed into trajERG)
-fig_box_seen_erg, axs_box_seen_erg = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_box_seen_erg.suptitle('Box Position Used Inside Trajectory ERG (XYZ)')
-
-axs_box_seen_erg[0].plot(t_time, data_box_pos_used_erg[:, 0], label='Box X (ERG)', linestyle='-', color='red')
-axs_box_seen_erg[1].plot(t_time, data_box_pos_used_erg[:, 1], label='Box Y (ERG)', linestyle='-', color='green')
-axs_box_seen_erg[2].plot(t_time, data_box_pos_used_erg[:, 2], label='Box Z (ERG)', linestyle='-', color='blue')
-
-axs_box_seen_erg[0].set_ylabel('X [m]')
-axs_box_seen_erg[1].set_ylabel('Y [m]')
-axs_box_seen_erg[2].set_ylabel('Z [m]')
-axs_box_seen_erg[2].set_xlabel('Time [s]')
-
-for ax in axs_box_seen_erg:
-    ax.grid(True)
-    ax.legend(loc='upper right')
-    ax.set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Plot rubber_pad world position
-fig_rubber_pad, axs_rubber_pad = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_rubber_pad.suptitle('Rubber Pad World Position (XYZ)')
-
-axs_rubber_pad[0].plot(t_time, data_rubber_pad_world[:, 0], label='rubber_pad X', linestyle='-', color='red')
-axs_rubber_pad[1].plot(t_time, data_rubber_pad_world[:, 1], label='rubber_pad Y', linestyle='-', color='green')
-axs_rubber_pad[2].plot(t_time, data_rubber_pad_world[:, 2], label='rubber_pad Z', linestyle='-', color='blue')
-
-axs_rubber_pad[0].set_ylabel('X [m]')
-axs_rubber_pad[1].set_ylabel('Y [m]')
-axs_rubber_pad[2].set_ylabel('Z [m]')
-axs_rubber_pad[2].set_xlabel('Time [s]')
-
-for ax in axs_rubber_pad:
-    ax.grid(True)
-    ax.legend(loc='upper right')
-    ax.set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create 4 clean graphs with consistent color scheme
-fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-fig.suptitle('Robot Control Performance', fontsize=16)
-
-# Define consistent color scheme for all 7 joints
-colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink']
-joint_names = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'J7']
-
-# Graph 1: Commanded (IK solutions) vs ERG output (aux reference/v)
-ax1.set_title('Commanded vs ERG Output (Joint Positions)', fontsize=14)
-for i in range(7):
-    ax1.plot(t_time, data_qr[:, i], label=f'{joint_names[i]} (IK)', color=colors[i], linestyle='-', linewidth=2)
-    ax1.plot(t_time, data_qv[:, i], label=f'{joint_names[i]} (ERG)', color=colors[i], linestyle='--', linewidth=2)
-ax1.set_ylabel('Position [rad]')
-ax1.grid(True)
-ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-ax1.set_xlim([t_time[1], t_time[-1]])
-
-# Graph 2: Joint Velocities
-ax2.set_title('Joint Velocities', fontsize=14)
-for i in range(7):
-    ax2.plot(t_time, data_qdot[:, i], label=f'{joint_names[i]}', color=colors[i], linewidth=2)
-ax2.set_ylabel('Velocity [rad/s]')
-ax2.grid(True)
-ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-ax2.set_xlim([t_time[1], t_time[-1]])
-
-# Graph 3: Joint Torques
-ax3.set_title('Joint Torques', fontsize=14)
-for i in range(7):
-    ax3.plot(t_time, data_tau[:, i], label=f'{joint_names[i]}', color=colors[i], linewidth=2)
-ax3.set_ylabel('Torque [Nm]')
-ax3.set_xlabel('Time [s]')
-ax3.grid(True)
-ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-ax3.set_xlim([t_time[1], t_time[-1]])
-
-# Graph 4: Joint Positions (Actual)
-ax4.set_title('Actual Joint Positions', fontsize=14)
-for i in range(7):
-    ax4.plot(t_time, data_q[:, i], label=f'{joint_names[i]}', color=colors[i], linewidth=2)
-ax4.set_ylabel('Position [rad]')
-ax4.set_xlabel('Time [s]')
-ax4.grid(True)
-ax4.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-ax4.set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout()
-plt.show()
-
-
-
-# Create a figure for system energy
-fig_energy, axs_energy = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-fig_energy.suptitle('System Energy')
-
-# Plot total energy
-axs_energy[0].plot(t_time, data_energy[:, 0], label='Total Energy', linestyle='-', color='blue')
-axs_energy[0].set_ylabel('Energy [J]')
-axs_energy[0].grid(True)
-axs_energy[0].legend(loc='upper right')
-
-# Plot kinetic and potential energy if available
-if data_energy.shape[1] > 1:
-    axs_energy[1].plot(t_time, data_energy[:, 1], label='Kinetic Energy', linestyle='-', color='red')
-    axs_energy[1].plot(t_time, data_energy[:, 2], label='Potential Energy', linestyle='-', color='green')
-    axs_energy[1].set_ylabel('Energy [J]')
-    axs_energy[1].grid(True)
-    axs_energy[1].legend(loc='upper right')
-
-axs_energy[-1].set_xlabel('Time [s]')
-axs_energy[-1].set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create a figure for contact forces
-fig_contact, axs_contact = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-fig_contact.suptitle('Contact Forces')
-
-# Plot contact forces (assuming first 3 components are x, y, z forces)
-if data_contact_forces.shape[1] >= 3:
-    axs_contact[0].plot(t_time, data_contact_forces[:, 0], label='Contact Force X', linestyle='-', color='red')
-    axs_contact[1].plot(t_time, data_contact_forces[:, 1], label='Contact Force Y', linestyle='-', color='green')
-    axs_contact[2].plot(t_time, data_contact_forces[:, 2], label='Contact Force Z', linestyle='-', color='blue')
-    
-    axs_contact[0].set_ylabel('Force X [N]')
-    axs_contact[1].set_ylabel('Force Y [N]')
-    axs_contact[2].set_ylabel('Force Z [N]')
-    
-    for ax in axs_contact:
-        ax.grid(True)
-        ax.legend(loc='upper right')
-        ax.set_xlim([t_time[1], t_time[-1]])
-    
-    axs_contact[2].set_xlabel('Time [s]')
-else:
-    # If contact forces data structure is different, plot all available components
-    for i in range(min(3, data_contact_forces.shape[1])):
-        axs_contact[i].plot(t_time, data_contact_forces[:, i], label=f'Contact Force {i+1}', linestyle='-')
-        axs_contact[i].set_ylabel(f'Force {i+1} [N]')
-        axs_contact[i].grid(True)
-        axs_contact[i].legend(loc='upper right')
-        axs_contact[i].set_xlim([t_time[1], t_time[-1]])
-    
-    axs_contact[2].set_xlabel('Time [s]')
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Create a figure for Z-axis integrator output (only Z, with contact detection markers)
-fig_z_integrator, ax_z = plt.subplots(1, 1, figsize=(12, 6))
-fig_z_integrator.suptitle('Z-Axis Integrator Output (Only Integrated Z)')
-
-# Plot Z-axis integrator output (only Z component)
-if data_z_integrated.shape[1] >= 3:
-    ax_z.plot(t_time, data_z_integrated[:, 2], label='Integrated Z', linestyle='-', color='blue', linewidth=2)
-    
-    # Find when contact transitions from 0 to 1
-    contact_values = data_contact_flag.flatten()
-    contact_transitions = []
-    for i in range(1, len(contact_values)):
-        # Check if contact just became active (0 -> 1)
-        if contact_values[i] > 0.5 and contact_values[i-1] <= 0.5:
-            contact_transitions.append(t_time[i])
-    
-    # Add vertical lines at contact detection points
-    for transition_time in contact_transitions:
-        ax_z.axvline(x=transition_time, color='red', linestyle='--', linewidth=1.5, 
-                     label='Contact detected' if transition_time == contact_transitions[0] else '')
-    
-    ax_z.set_ylabel('Integrated Z [m]')
-    ax_z.set_xlabel('Time [s]')
-    ax_z.grid(True)
-    ax_z.legend(loc='upper right')
-    ax_z.set_xlim([t_time[1], t_time[-1]])
-    
-    print(f"\nContact detected at times: {contact_transitions}")
-else:
-    # If Z-axis integrator data structure is different, plot the last component
-    ax_z.plot(t_time, data_z_integrated[:, -1], label='Integrated Z', linestyle='-', color='blue', linewidth=2)
-    ax_z.set_ylabel('Integrated Z [m]')
-    ax_z.set_xlabel('Time [s]')
-    ax_z.grid(True)
-    ax_z.legend(loc='upper right')
-    ax_z.set_xlim([t_time[1], t_time[-1]])
-
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# Keep plots open
-print("\nPlots displayed. Close windows or press Enter to continue...")
-input()
-
-# Print summary statistics for energy and contact forces
-# print("\n=== Energy and Contact Forces Summary ===")
-# print(f"Final total energy: {data_energy[-1, 0]:.4f} J")
-# if data_energy.shape[1] > 1:
-#     print(f"Final kinetic energy: {data_energy[-1, 1]:.4f} J")
-#     print(f"Final potential energy: {data_energy[-1, 2]:.4f} J")
-
-# print(f"Max contact force magnitude: {np.max(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
-# print(f"Average contact force magnitude: {np.mean(np.linalg.norm(data_contact_forces, axis=1)):.4f} N")
-
-# Print summary statistics for Z-axis integrator
-# print("\n=== Z-Axis Integrator Summary ===")
-# if data_z_integrated.shape[1] >= 3:
-#     print(f"Final integrated position: [{data_z_integrated[-1, 0]:.4f}, {data_z_integrated[-1, 1]:.4f}, {data_z_integrated[-1, 2]:.4f}] m")
-#     print(f"X range: [{np.min(data_z_integrated[:, 0]):.4f}, {np.max(data_z_integrated[:, 0]):.4f}] m")
-#     print(f"Y range: [{np.min(data_z_integrated[:, 1]):.4f}, {np.max(data_z_integrated[:, 1]):.4f}] m")
-#     print(f"Z range: [{np.min(data_z_integrated[:, 2]):.4f}, {np.max(data_z_integrated[:, 2]):.4f}] m")
-# else:
-#     print(f"Z-axis integrator output shape: {data_z_integrated.shape}")
-#     print(f"Final integrated values: {data_z_integrated[-1, :]}")
